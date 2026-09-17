@@ -1,0 +1,3 @@
+# Rust build output. Cargo.lock IS tracked (below) — it pins the full ~500-crate
+# transitive tree, which matters for an exact-pinned experimental Tor dependency.
+/target

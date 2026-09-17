@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Molepipe</title>
+<style>
+  /* Matches the app's surface colours in both themes so the handover to the
+     real UI is not a flash of white. Nothing here is part of the app: this
+     page is replaced by the loopback URL as soon as the window exists. */
+  :root { color-scheme: light dark; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: grid; place-items: center;
+    background: #fef7ff; color: #1d1b20;
+    font: 15px/1.5 system-ui, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    body { background: #141218; color: #e6e0e9; }
+  }
+  .boot-logo { width: 80px; height: 80px; display: block; margin: 0 auto 1rem; }
+  .dot {
+    width: 34px; height: 34px; margin: 0 auto 14px;
+    border: 3px solid #66558e; border-right-color: transparent;
+    border-radius: 50%; animation: spin 900ms linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  p { opacity: .7; text-align: center; }
+</style>
+</head>
+<body>
+  <div>
+    <img src="logo.svg" alt="Molepipe" class="boot-logo">
+    <div class="dot"></div>
+    <p>Starting Molepipe…</p>
+  </div>
+</body>
+</html>

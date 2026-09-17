@@ -1,0 +1,1557 @@
+:root {
+  --sat: env(safe-area-inset-top, 0px);
+  --sab: env(safe-area-inset-bottom, 0px);
+  --sal: env(safe-area-inset-left, 0px);
+  --sar: env(safe-area-inset-right, 0px);
+  --kb: 0px; /* soft-keyboard height above the nav bar; set by the Android shell */
+  --md-ref-typeface-brand: 'Roboto', system-ui, -apple-system, sans-serif;
+  --md-ref-typeface-plain: 'Roboto', system-ui, -apple-system, sans-serif;
+  /* Shape scale (Material 3 Expressive): each radius has a role rather than four
+     interchangeable values. xs=chips/tags, s=nested/menus, m=rows & fields,
+     l=bubbles & standard buttons, xl=hero cards, 2xl=the biggest hero, full=pills. */
+  --shape-xs: 4px;
+  --shape-s: 8px;
+  --shape-m: 12px;
+  --shape-l: 16px;
+  --shape-xl: 28px;
+  --shape-2xl: 36px;
+  --shape-full: 999px;
+  /* Spring easings: press = a quick stretch-and-settle on tap; emph = an
+     emphasized overshoot for card/nav morphs. Honour reduced-motion below. */
+  --spring-press: cubic-bezier(0.2, 0.8, 0.2, 1.2);
+  --spring-emph: cubic-bezier(0.3, 1.4, 0.4, 1);
+  --elev-1: 0 1px 2px 0 rgb(0 0 0 / 0.3), 0 1px 3px 1px rgb(0 0 0 / 0.15);
+  --elev-2: 0 1px 2px 0 rgb(0 0 0 / 0.3), 0 2px 6px 2px rgb(0 0 0 / 0.15);
+}
+
+* { box-sizing: border-box; }
+/* The hidden attribute must win over any display: set in a class below. */
+[hidden] { display: none !important; }
+html, body { height: 100%; }
+/* Kill the WebView's default blue tap-highlight rectangle everywhere. It's an
+   inherited property, so one declaration on the root covers every tappable
+   element (nav bar, settings sub-tabs, list rows) — the M3 components supply
+   their own press/ripple states. Individual components used to set this ad hoc;
+   the root rule makes those redundant but they're left as local documentation. */
+html { -webkit-tap-highlight-color: transparent; }
+/* The frame is centred by the body's own flex box, NOT by a margin on #app: a
+   top margin on a height:100% body adds to the page height instead of moving
+   within it, which grew the document past the viewport and put a scrollbar down
+   the side of a page that has nothing to scroll. */
+body {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--md-sys-color-surface-dim, #111);
+  color: var(--md-sys-color-on-surface);
+  font-family: var(--md-ref-typeface-plain);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* The app frame: a phone-like column, centered on desktop, full-bleed on mobile. */
+#app {
+  position: relative;
+  width: 100%;
+  max-width: 480px;
+  height: 100dvh;
+  /* Make room for the soft keyboard (Android edge-to-edge doesn't resize the
+     window for it). box-sizing:border-box shrinks the flex column, lifting the
+     compose bar above the keyboard. The transition roughly tracks its slide. */
+  padding-bottom: var(--kb);
+  transition: padding-bottom 0.18s ease;
+  display: flex;
+  flex-direction: column;
+  background: var(--md-sys-color-surface);
+  overflow: hidden;
+}
+@media (min-width: 520px) {
+  #app { height: min(880px, 100dvh); border-radius: var(--shape-xl); box-shadow: var(--elev-2); }
+}
+/* Tablet: lift the 480px width cap so the app fills the screen. */
+@media (min-width: 600px) {
+  #app { max-width: none; }
+}
+
+/* In the desktop build the window *is* the frame. The floating card reads well
+   in a browser tab, but inside a native window it draws a second set of rounded
+   corners nested inside the window manager's, with a strip of backdrop showing
+   between them. So: no radius, no shadow, no width cap, and the body painted
+   the same colour as the app — the corners the compositor clips would otherwise
+   show the dim backdrop through as a hairline. Scoped to [data-shell] so the
+   browser build is untouched. */
+:root[data-shell="desktop"] body { background: var(--md-sys-color-surface); }
+:root[data-shell="desktop"] #app {
+  max-width: none;
+  height: 100dvh;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+/* --- type scale --- */
+.display { margin: 0 0 1rem; font-size: 1.6rem; font-weight: 500; }
+.headline { margin: 0; font-size: 1.4rem; font-weight: 500; }
+.title { margin: 0; font-size: 1rem; font-weight: 500; }
+.body { font-size: 0.95rem; line-height: 1.5; margin: 0.4rem 0; }
+.label { font-size: 0.75rem; font-weight: 500; letter-spacing: 0.03em; }
+.muted { color: var(--md-sys-color-on-surface-variant); }
+.error { color: var(--md-sys-color-error); }
+/* Onion-address well (item 6): a neutral inset panel below the hero — quieter
+   than the hero surface so the hero stays the anchor. A hairline keeps it from
+   reading as a hole where the dark-theme tonal step is large. Bigger monospace +
+   line-height for legibility; endpoint emphasis comes from the .addr-* spans. */
+.account {
+  font-family: ui-monospace, 'Roboto Mono', Menlo, monospace;
+  font-size: 0.95rem; line-height: 1.7; letter-spacing: 0.02em;
+  word-break: break-all; margin: 0.5rem 0 0.75rem;
+  padding: 0.7rem 0.85rem;
+  background: var(--md-sys-color-surface);
+  border: 1px solid var(--md-sys-color-outline-variant);
+  border-radius: var(--shape-l);
+  color: var(--md-sys-color-on-surface);
+}
+.addr-hi { color: var(--md-sys-color-primary); font-weight: 700; }
+.addr-mid { color: var(--md-sys-color-on-surface-variant); }
+.addr-tld { color: var(--md-sys-color-on-surface-variant); font-weight: 500; }
+
+.icon { width: 24px; height: 24px; fill: currentColor; display: block; }
+.card-surface {
+  background: var(--md-sys-color-surface-container);
+  border-radius: var(--shape-l);
+  padding: 1rem;
+}
+/* Hero card (account/onion): the top of the shape scale — a soft squircle on a
+   raised container so it anchors the page instead of blending into the stack of
+   uniform cards. Gives the You page visual rhythm (item 1: shape scale). */
+.hero-card {
+  border-radius: var(--shape-2xl);
+  background: var(--md-sys-color-surface-container-highest);
+  padding: 1.2rem 1.3rem;
+}
+.stack { display: flex; flex-direction: column; gap: 0.85rem; }
+.row-between { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }
+.full { width: 100%; }
+md-filled-text-field, md-outlined-text-field, md-filled-button { width: 100%; }
+/* Password input fields: taller for better touch targets */
+md-filled-text-field[type="password"],
+md-outlined-text-field[type="password"] {
+  --md-filled-text-field-container-height: 56px;
+  --md-outlined-text-field-container-height: 56px;
+}
+
+/* Text-field standardization (item 4): pre-unlock auth screens use Filled, the
+   post-unlock settings views use Outlined — each screen is one style. The single
+   deliberate exception is the recovery phrase, the one irreplaceable secret: an
+   asymmetric cut-corner shape + heavier outline (item 1's "cut-corner/extreme
+   radius") marks it high-stakes, so its Outlined style beside the Filled password
+   on the recover screen reads as intentional emphasis, not an accidental mix.
+   Literal values only — these props cross into the component's shadow DOM, where
+   var()-in-var() misbehaves on desktop WebKit. */
+#recover-mnemonic {
+  --md-outlined-text-field-container-shape-start-start: 20px;
+  --md-outlined-text-field-container-shape-start-end: 6px;
+  --md-outlined-text-field-container-shape-end-start: 6px;
+  --md-outlined-text-field-container-shape-end-end: 20px;
+  --md-outlined-text-field-outline-width: 2px;
+  --md-outlined-text-field-focus-outline-width: 3px;
+}
+
+.icon-btn {
+  border: 0; background: transparent; color: var(--md-sys-color-on-surface-variant);
+  width: 48px; height: 48px; border-radius: 50%; display: grid; place-items: center; cursor: pointer;
+}
+.icon-btn:hover { background: color-mix(in srgb, var(--md-sys-color-on-surface) 8%, transparent); }
+.icon-btn:focus-visible { outline: 2px solid var(--md-sys-color-primary); outline-offset: 2px; }
+/* Push a header button to the far right of a flex .pane-header (title stays left). */
+.header-action { margin-left: auto; }
+
+/* --- search overlay (top-right search icon on the chat list) --- */
+.search-view {
+  position: fixed; inset: 0; z-index: 60;
+  display: flex; flex-direction: column;
+  background: var(--md-sys-color-surface);
+}
+.search-view[hidden] { display: none; }
+.search-bar {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 0.35rem;
+  height: calc(56px + var(--sat));
+  padding: var(--sat) calc(0.5rem + var(--sar)) 0 calc(0.5rem + var(--sal));
+  border-bottom: 1px solid var(--md-sys-color-outline-variant);
+}
+.search-input {
+  flex: 1; min-width: 0; border: 0; outline: none; background: transparent;
+  font-family: var(--md-ref-typeface-plain); font-size: 1.05rem;
+  color: var(--md-sys-color-on-surface); padding: 0.5rem 0.25rem;
+}
+.search-input::placeholder { color: var(--md-sys-color-on-surface-variant); }
+.search-results { flex: 1; min-height: 0; overflow-y: auto; }
+/* When there are no results the list must not absorb free space, or the
+   empty-state message gets pushed to the very bottom of the viewport. */
+.search-results:empty { flex: 0 0 auto; }
+.search-empty { padding: 2.5rem 1.5rem; text-align: center; display: flex; flex-direction: column; align-items: center; gap: 0.75rem; }
+.search-empty-icon { color: var(--md-sys-color-outline); opacity: 0.5; }
+
+/* --- springy press (Material 3 Expressive) ---
+   A quick stretch-and-settle on tap. Works on the Material Web buttons via a
+   transform on the host element, and on our own buttons. The keypad has its own
+   press already; nav items animate their indicator, not the whole tile. */
+md-filled-button, md-filled-tonal-button, md-outlined-button, md-text-button,
+.send-btn, .fab, .seg, .mode-btn, .img-download, .relay-offer {
+  transition: transform .22s var(--spring-press), filter .15s ease, background .2s ease;
+}
+md-filled-button:active, md-filled-tonal-button:active, md-outlined-button:active,
+md-text-button:active, .fab:active, .seg:active, .mode-btn:active,
+.send-btn:not(:disabled):active, .img-download:not(:disabled):active, .relay-offer:active {
+  transform: scale(0.93);
+}
+
+/* --- onboarding / locked / loading --- */
+.loading-logo, .onboard-logo {
+  display: block; margin: 0 auto;
+  width: 80px; height: 80px;
+}
+.onboard-logo { margin-bottom: 0.5rem; }
+.center-screen { flex: 1; display: grid; place-items: center; padding: calc(1.5rem + var(--sat)) calc(1.5rem + var(--sar)) calc(1.5rem + var(--sab)) calc(1.5rem + var(--sal)); overflow-y: auto; }
+.onboard { width: 100%; max-width: 400px; padding: 1.75rem; }
+.onboard form { display: flex; flex-direction: column; gap: 0.9rem; margin-top: 0.5rem; }
+
+/* --- onboarding wizard --- */
+.wizard { display: flex; flex-direction: column; }
+/* Progress: a row of dots + "Step X of N", shown only on the numbered steps. */
+.wiz-progress { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; margin-bottom: 1rem; }
+.wiz-progress[hidden] { display: none; }
+.wiz-dots { display: flex; align-items: center; gap: 0.4rem; }
+.wiz-dot { width: 8px; height: 8px; border-radius: var(--shape-full); background: var(--md-sys-color-surface-container-highest); transition: background 0.2s ease, width 0.2s ease; }
+.wiz-dot.done { background: var(--md-sys-color-primary); opacity: 0.5; }
+.wiz-dot.active { background: var(--md-sys-color-primary); width: 22px; }
+#wiz-count { white-space: nowrap; }
+
+.wiz-step { display: flex; flex-direction: column; gap: 0.9rem; }
+.wiz-step[hidden] { display: none; }
+.wiz-step > .title { margin: 0; text-align: center; }
+.wiz-step[data-step="welcome"], .wiz-step[data-step="done"] { align-items: center; text-align: center; }
+.wiz-choices { display: flex; flex-direction: column; gap: 0.5rem; width: 100%; margin-top: 0.5rem; }
+.wiz-choices md-filled-button { width: 100%; }
+
+/* A soft icon medallion atop each explainer step. */
+.wiz-hero {
+  width: 64px; height: 64px; border-radius: 50%; margin: 0.25rem auto 0;
+  display: grid; place-items: center;
+  background: var(--md-sys-color-primary-container); color: var(--md-sys-color-on-primary-container);
+}
+.wiz-hero .icon { width: 30px; height: 30px; }
+.wiz-hero-ok { background: var(--md-sys-color-secondary-container); color: var(--md-sys-color-on-secondary-container); }
+
+/* Plain-language bullet points — generous spacing, easy to read. */
+.wiz-points { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.85rem; }
+.wiz-points li { position: relative; padding-left: 1.5rem; line-height: 1.45; color: var(--md-sys-color-on-surface-variant); }
+.wiz-points li::before {
+  content: ""; position: absolute; left: 0.3rem; top: 0.5em;
+  width: 6px; height: 6px; border-radius: 50%; background: var(--md-sys-color-primary);
+}
+
+/* Back / Next footer for the explainer steps. */
+.wiz-nav { display: flex; align-items: center; gap: 0.5rem; margin-top: 1.1rem; }
+.wiz-nav[hidden] { display: none; }
+.wiz-nav #wiz-next { margin-left: auto; }
+
+/* Profile step: avatar row + display name field. */
+.wiz-profile-fields { display: flex; flex-direction: column; gap: 1rem; }
+.wiz-avatar-row { display: flex; align-items: center; gap: 1rem; }
+.wiz-avatar-row .avatar-picker { position: relative; flex-shrink: 0; }
+.wiz-avatar-row .avatar-edit-badge {
+  position: absolute; bottom: 0; right: 0;
+  width: 24px; height: 24px; border-radius: 50%;
+  background: var(--md-sys-color-primary); color: var(--md-sys-color-on-primary);
+  display: grid; place-items: center;
+}
+.wiz-step-actions { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.5rem; }
+.wiz-step-actions md-filled-button { margin-left: auto; }
+
+/* PIN step fields. */
+.wiz-pin-fields { display: flex; flex-direction: column; gap: 0.75rem; margin-top: 0.5rem; }
+
+/* Donate card in the done step — brighter, warm tones. */
+.wiz-donate-card {
+  display: flex; align-items: center; gap: 0.75rem;
+  margin-top: 1.25rem; padding: 0.75rem 1rem;
+  border-radius: var(--shape-m);
+  background: linear-gradient(135deg, #fde8e8 0%, #fce4ec 100%);
+  border: 1px solid #f8bbd0;
+}
+.wiz-donate-icon {
+  width: 40px; height: 40px; border-radius: 50%; flex-shrink: 0;
+  display: grid; place-items: center;
+  background: #e91e63; color: #fff;
+}
+.wiz-donate-btn { color: #c2185b; }
+
+/* Password-strength hint under the create-password field. */
+.pw-strength { display: flex; align-items: center; gap: 0.6rem; margin: -0.35rem 0.1rem 0; }
+.pw-strength[hidden] { display: none; }
+.pw-strength-bar {
+  flex: 1; height: 6px; border-radius: var(--shape-full); overflow: hidden;
+  background: var(--md-sys-color-surface-container-highest);
+}
+.pw-strength-bar i { display: block; height: 100%; width: 0; border-radius: inherit; transition: width 0.2s ease, background 0.2s ease; }
+.pw-strength.s1 .pw-strength-bar i { width: 33%; background: var(--md-sys-color-error); }
+.pw-strength.s2 .pw-strength-bar i { width: 66%; background: #c98a00; }
+.pw-strength.s3 .pw-strength-bar i { width: 100%; background: var(--md-sys-color-primary); }
+#pw-strength-label { min-width: 3.2rem; text-align: right; }
+
+/* Recovery-phrase verification: a little breathing room below the intro copy. */
+#verify-fields { margin-top: 0.5rem; }
+
+/* --- login / unlock card --- */
+.lock-card { display: flex; flex-direction: column; align-items: center; text-align: center; padding: 2rem 1.75rem 1.5rem; }
+.lock-badge {
+  width: 64px; height: 64px; border-radius: 50%; display: grid; place-items: center;
+  background: var(--md-sys-color-primary-container); color: var(--md-sys-color-on-primary-container);
+  margin-bottom: 1rem;
+}
+.lock-badge .icon { width: 30px; height: 30px; }
+.lock-title { margin: 0; font-size: 1.6rem; line-height: 1.2; }
+.lock-subtitle { margin: 0.35rem 0 0.5rem; }
+/* The forms fill the card width so fields/buttons align under the centered head. */
+.lock-card form { width: 100%; align-items: stretch; }
+.lock-card #forgot-btn { margin-top: 0.25rem; }
+/* The desktop PIN view is a nested wrapper, so it doesn't inherit the form's
+   row gap — give it its own, or the PIN field and Unlock button touch. */
+#pin-desktop-view { display: flex; flex-direction: column; gap: 0.9rem; }
+/* Recovery phrase as a numbered two/three-column grid — each word paired with
+   its position so it's transcribed in order. The ordinal is a CSS counter, so
+   the list's textContent stays the bare 24 words (see renderPhrase). */
+.phrase-grid {
+  list-style: none; margin: 0.6rem 0 1rem; padding: 0.7rem 0.6rem;
+  background: var(--md-sys-color-surface-container-highest);
+  border-radius: var(--shape-m);
+  display: grid; grid-template-columns: repeat(2, 1fr); gap: 0.3rem 0.5rem;
+  counter-reset: phrase;
+}
+/* Three columns only where an 8-char BIP39 word still fits without wrapping
+   (tablet / desktop split-pane); phones stay at two clean columns. */
+@media (min-width: 560px) { .phrase-grid { grid-template-columns: repeat(3, 1fr); } .phrase-word { font-size: 0.95rem; } }
+.phrase-word {
+  counter-increment: phrase;
+  display: flex; align-items: baseline; gap: 0.4rem;
+  padding: 0.28rem 0.5rem; border-radius: var(--shape-s);
+  font-family: ui-monospace, monospace; font-size: 0.9rem; line-height: 1.3;
+  color: var(--md-sys-color-on-surface); word-break: break-word;
+}
+.phrase-word::before {
+  content: counter(phrase);
+  flex: 0 0 1.4em; text-align: right;
+  font-variant-numeric: tabular-nums; font-size: 0.72rem;
+  color: var(--md-sys-color-on-surface-variant); user-select: none;
+}
+.phrase-actions {
+  display: flex; gap: 0.5rem; margin: 0.5rem 0 1rem;
+}
+.modal-backdrop {
+  position: fixed; inset: 0; z-index: 1000;
+  background: rgba(0,0,0,0.45);
+  display: flex; align-items: center; justify-content: center;
+}
+.modal-card {
+  background: var(--md-sys-color-surface);
+  border-radius: var(--shape-l);
+  padding: 1.5rem; max-width: 480px; width: 90%;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.25);
+}
+.modal-card .title { margin: 0 0 0.5rem; }
+.modal-card .body { margin: 0 0 1.2rem; }
+.modal-actions {
+  display: flex; justify-content: flex-end; gap: 0.5rem;
+}
+.pw-requirements {
+  list-style: none; margin: 0.3rem 0 0.8rem; padding: 0;
+  font-size: 0.78rem; color: var(--md-sys-color-outline);
+}
+.pw-requirements li {
+  padding: 0.1rem 0;
+  transition: color 0.15s;
+}
+.pw-requirements li::before {
+  content: "\25CB";  /* ○ neutral circle */
+  margin-right: 0.4rem;
+  color: var(--md-sys-color-outline);
+  transition: content 0.15s, color 0.15s;
+}
+.pw-requirements li.met {
+  color: var(--md-sys-color-primary);
+}
+.pw-requirements li.met::before {
+  content: "\2713";  /* ✓ */
+  color: var(--md-sys-color-primary);
+}
+.pw-requirements li.unmet {
+  color: var(--md-sys-color-error);
+}
+.pw-requirements li.unmet::before {
+  content: "\2717";  /* ✗ */
+  color: var(--md-sys-color-error);
+}
+.confirm-wrap {
+  position: relative;
+}
+.pw-field-wrap {
+  position: relative;
+}
+.pw-toggle {
+  position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
+  background: none; border: none; cursor: pointer;
+  color: var(--md-sys-color-outline); padding: 4px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  transition: color 0.15s;
+}
+.pw-toggle:hover { color: var(--md-sys-color-on-surface); }
+.pw-match-icon {
+  position: absolute; right: 40px; top: 50%; transform: translateY(-50%);
+  font-size: 1.1rem; pointer-events: none;
+}
+.pw-match-icon.match { color: var(--md-sys-color-primary); }
+.pw-match-icon.nomatch { color: var(--md-sys-color-error); }
+.onboard-links {
+  display: flex; flex-direction: column; align-items: center; gap: 0.2rem;
+  margin-top: 0.5rem;
+}
+.privacy-footer {
+  display: flex; align-items: center; justify-content: center; gap: 0.3rem;
+  margin-top: 1.2rem; font-size: 0.72rem;
+  color: var(--md-sys-color-outline);
+}
+.privacy-footer .icon { width: 14px; height: 14px; opacity: 0.6; }
+.recover-header {
+  display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem;
+}
+
+/* --- keypad view (Android PIN lock) --- */
+.keypad-view {
+  display: flex; flex-direction: column; align-items: center; gap: 1.25rem; margin: 0.5rem 0 0.5rem;
+}
+.pin-dots {
+  display: flex; justify-content: center; align-items: center; gap: 14px;
+  margin: 0.25rem 0; min-height: 18px; /* reserve the row so nothing jumps */
+}
+.pin-dot {
+  width: 14px; height: 14px; border-radius: 50%;
+  background: var(--md-sys-color-primary);
+  animation: pin-dot-in 0.16s cubic-bezier(0.2, 0.7, 0.3, 1.4);
+}
+@keyframes pin-dot-in {
+  from { transform: scale(0); opacity: 0; }
+  to   { transform: scale(1); opacity: 1; }
+}
+.keypad-grid {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px;
+  width: 100%; max-width: 280px; margin: 0 auto;
+}
+.keypad-btn {
+  width: 70px; height: 70px; border-radius: 50%; margin: 0 auto;
+  background: var(--md-sys-color-surface-container-high); color: var(--md-sys-color-on-surface);
+  border: 1px solid var(--md-sys-color-outline-variant);
+  font-family: var(--md-ref-typeface-plain); font-size: 1.5rem; font-weight: 500;
+  display: grid; place-items: center; cursor: pointer; user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  transition: background 0.12s ease, transform 0.08s ease, border-color 0.12s ease;
+}
+/* Only real (mouse) hover — Android WebView keeps :hover on the last-tapped key
+   until another tap lands, which leaves the border recoloured as a "ghost". */
+@media (hover: hover) {
+  .keypad-btn:hover { border-color: var(--md-sys-color-outline); }
+}
+/* A tap also leaves the key :focus, so the UA outline lingers. Drop it for
+   pointer/touch focus but keep a real ring for keyboard navigation. */
+.keypad-btn:focus { outline: none; }
+.keypad-btn:focus-visible { outline: 2px solid var(--md-sys-color-primary); outline-offset: 2px; }
+.keypad-btn:active {
+  background: var(--md-sys-color-primary-container); color: var(--md-sys-color-on-primary-container);
+  border-color: transparent; transform: scale(0.92);
+}
+/* Back / submit are chromeless so the digits read as the primary affordance. */
+.keypad-btn-action { background: transparent; border-color: transparent; color: var(--md-sys-color-on-surface-variant); }
+.keypad-btn-action:active { background: var(--md-sys-color-surface-container-highest); transform: scale(0.92); }
+/* The confirm (✓) key is the one call-to-action on the pad, so tint it. */
+.keypad-btn[data-action="submit"] { background: var(--md-sys-color-primary); color: var(--md-sys-color-on-primary); }
+.keypad-btn[data-action="submit"]:active { background: var(--md-sys-color-primary); transform: scale(0.92); }
+
+/* --- modal dialog (offline-send relay picker) --- */
+.modal-backdrop {
+  position: fixed; inset: 0; z-index: 50; display: grid; place-items: center;
+  padding: calc(1rem + var(--sat)) calc(1rem + var(--sar)) calc(1rem + var(--sab)) calc(1rem + var(--sal));
+  background: color-mix(in srgb, black 45%, transparent);
+  animation: modal-fade 0.12s ease;
+  /* When keyboard is open (--kb > 0), shift the modal up so it's not hidden */
+  padding-bottom: calc(1rem + var(--sab) + var(--kb, 0px));
+}
+@keyframes modal-fade { from { opacity: 0; } to { opacity: 1; } }
+.modal-card {
+  width: 100%; max-width: 480px; max-height: 100%; overflow-y: auto;
+  background: var(--md-sys-color-surface-container-high); color: var(--md-sys-color-on-surface);
+  border-radius: var(--shape-l); padding: 1.5rem; box-shadow: var(--elev-2);
+  display: flex; flex-direction: column; gap: 0.75rem;
+}
+.modal-title { margin: 0; font-size: 1.25rem; font-weight: 500; }
+.modal-actions { justify-content: flex-end; gap: 0.5rem; margin-top: 0.25rem; }
+.relay-list { display: flex; flex-direction: column; gap: 0.4rem; margin: 0.25rem 0; }
+.relay-item {
+  display: flex; align-items: center; gap: 0.65rem; width: 100%; font: inherit; text-align: left;
+  padding: 0.7rem 0.9rem; border: 1px solid var(--md-sys-color-outline-variant);
+  border-radius: var(--shape-m); background: transparent; color: var(--md-sys-color-on-surface); cursor: pointer;
+}
+.relay-item[aria-checked="true"] {
+  border-color: var(--md-sys-color-primary); background: var(--md-sys-color-primary-container);
+  color: var(--md-sys-color-on-primary-container);
+}
+.relay-item .radio {
+  width: 18px; height: 18px; border-radius: 50%; flex-shrink: 0;
+  border: 2px solid var(--md-sys-color-outline);
+}
+.relay-item[aria-checked="true"] .radio {
+  border-color: var(--md-sys-color-primary);
+  background: radial-gradient(circle, var(--md-sys-color-primary) 42%, transparent 46%);
+}
+
+/* --- app shell: sidebar (list) + detail (chat) --- */
+/* Column so the desktop-shell notice can sit above the shell in flow rather
+   than floating over it. With the notice hidden this is a single flex:1 child
+   filling the box, exactly as the row version was. */
+#view-unlocked { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+#shell { flex: 1; position: relative; display: flex; min-height: 0; }
+#sidebar { position: absolute; inset: 0; display: flex; flex-direction: column; min-height: 0; }
+#detail { position: absolute; inset: 0; z-index: 5; display: none; flex-direction: column; background: var(--md-sys-color-surface); min-height: 0; }
+#shell.detail-open #detail { display: flex; }
+
+.pane-header {
+  position: relative; flex-shrink: 0; height: calc(56px + var(--sat)); display: flex; align-items: center; gap: 0.25rem;
+  padding: var(--sat) calc(0.5rem + var(--sar)) 0 calc(0.5rem + var(--sal)); background: var(--md-sys-color-surface);
+  border-bottom: 1px solid var(--md-sys-color-outline-variant);
+}
+.pane-header h1, .pane-header h2 { margin: 0 0 0 0.5rem; font-size: 1.25rem; font-weight: 500; }
+
+#list-pane { flex: 1; position: relative; min-height: 0; }
+.tab { position: absolute; inset: 0; overflow-y: auto; }
+
+#detail-body { flex: 1; position: relative; min-height: 0; }
+.pane, #detail-placeholder { position: absolute; inset: 0; }
+.pane { display: flex; flex-direction: column; background: var(--md-sys-color-surface); overflow-y: auto; }
+#chat-screen.pane { overflow: hidden; }
+#add-screen, #contact-info { padding: 1rem; }
+#detail-placeholder { display: grid; place-items: center; text-align: center; padding: 2rem; }
+
+/* desktop two-pane */
+@media (min-width: 900px) {
+  #app { max-width: 1400px; height: min(900px, 100dvh); }
+  #shell { display: grid; grid-template-columns: minmax(400px, 38%) 1fr; position: static; }
+  #sidebar { position: static; border-right: 1px solid var(--md-sys-color-outline-variant); }
+  #detail { position: static; display: flex; }
+  #back-btn { display: none !important; }
+  /* Constrain right-pane FORM content (add someone, contact info) to a readable
+     column on very wide screens. */
+  .pane { max-width: 560px; margin: 0 auto; }
+  #detail-placeholder { max-width: 560px; margin: 0 auto; }
+  /* The chat is not a form — let it fill the whole detail pane instead of sitting
+     in a narrow centered column with large empty gutters. Bubbles keep their own
+     max-width, so text lines stay readable while the header/composer span the pane. */
+  #chat-screen.pane { max-width: none; margin: 0; }
+  /* Cap the bubble line length so the now-wide pane doesn't stretch text into
+     over-long, hard-to-read lines (mobile keeps the base 82% rule). The cap lives
+     on the row only; the inner .bubble fills it (capping both would compound the
+     percentages and make bubbles narrower than before). */
+  #chat-screen .bubble-row { max-width: min(82%, 620px); }
+  #chat-screen .bubble { max-width: 100%; }
+}
+
+/* bottom navigation — a floating pill bar detached from the edge (M3 Expressive),
+   not a flush rectangular bar. It stays a flex child (reserves its own space, no
+   overlap), but the margins + full radius + shadow make it read as floating. */
+#bottomnav {
+  flex-shrink: 0; display: flex; gap: 0.25rem;
+  margin: 0.25rem calc(10px + var(--sar)) calc(10px + var(--sab)) calc(10px + var(--sal));
+  padding: 0.4rem;
+  background: var(--md-sys-color-surface-container-high);
+  border-radius: var(--shape-full);
+  box-shadow: var(--elev-2);
+  position: relative; z-index: 4;
+}
+.navitem {
+  position: relative;
+  flex: 1; border: 0; background: transparent; cursor: pointer;
+  display: flex; flex-direction: column; align-items: center; justify-content: flex-start; gap: 2px;
+  padding: 0.6rem 0 0.5rem;
+  color: var(--md-sys-color-on-surface-variant); font-size: 0.7rem; font-weight: 500;
+  -webkit-tap-highlight-color: transparent;
+  min-height: 48px;
+}
+/* Pill-shaped active indicator behind the icon (real M3 NavigationBar look),
+   scaling in with a spring. A pseudo-element so it works whether or not the item
+   wraps its icon in a badge span — the markup differs across the three tabs. */
+.navitem::before {
+  content: ""; position: absolute; top: 0.3rem; left: 50%;
+  width: 62%; max-width: 66px; height: 28px; border-radius: var(--shape-full);
+  background: var(--md-sys-color-secondary-container);
+  transform: translateX(-50%) scale(0.4); opacity: 0;
+  transition: opacity .2s ease, transform .4s var(--spring-emph);
+  z-index: 0;
+}
+.navitem.active::before { opacity: 1; transform: translateX(-50%) scale(1); }
+.navitem .nav-badge-wrap, .navitem .icon, .navitem > span { position: relative; z-index: 1; }
+.navitem.active { color: var(--md-sys-color-on-surface); }
+.navitem .icon { transition: transform .3s var(--spring-emph), color .2s ease; }
+.navitem.active .icon { color: var(--md-sys-color-on-secondary-container); transform: translateY(-1px); }
+.nav-badge-wrap { position: relative; }
+.badge {
+  position: absolute; top: -6px; right: -10px; min-width: 18px; height: 18px; padding: 0 4px;
+  border-radius: 9px; background: var(--md-sys-color-error); color: var(--md-sys-color-on-error);
+  font-size: 0.66rem; font-weight: 700; display: grid; place-items: center;
+  /* Sit in front of the icon: the icon is z-index:1 within .nav-badge-wrap's
+     stacking context, so an auto/0 badge paints behind it where they overlap. */
+  z-index: 2;
+}
+
+/* fab */
+.fab {
+  position: absolute; right: calc(16px + var(--sar)); bottom: 16px; height: 56px; border: 0; cursor: pointer;
+  border-radius: var(--shape-l); background: var(--md-sys-color-primary-container);
+  color: var(--md-sys-color-on-primary-container); display: grid; place-items: center;
+  box-shadow: var(--elev-2); z-index: 3;
+}
+.fab:hover { filter: brightness(1.05); }
+/* Extended FAB: icon + label pill. */
+.fab-extended {
+  display: inline-flex; align-items: center; gap: 0.5rem;
+  width: auto; padding: 0 20px 0 16px;
+}
+.fab-extended .fab-label { font-size: 0.95rem; font-weight: 600; white-space: nowrap; }
+
+/* tabs */
+#tab-chats, #tab-requests { padding: 0.5rem 0.5rem 5rem; }
+#tab-you { padding: 0.75rem 0.75rem 5rem; display: flex; flex-direction: column; gap: 1rem; min-height: 0; }
+md-list { --md-list-container-color: transparent; }
+.empty-state {
+  display: flex; flex-direction: column; align-items: center; text-align: center;
+  gap: 0.55rem; margin-top: 3.25rem; padding: 0 2rem;
+}
+.empty-art {
+  width: 92px; height: 92px; display: grid; place-items: center; margin-bottom: 0.3rem;
+  background: var(--md-sys-color-primary-container); color: var(--md-sys-color-on-primary-container);
+  /* Organic, asymmetric "squircle" blob — M3 Expressive shape, not a plain circle. */
+  border-radius: 62% 38% 58% 42% / 46% 58% 42% 54%;
+}
+.empty-icon { width: 38px; height: 38px; }
+.empty-title { margin: 0; font-size: 1.15rem; font-weight: 600; color: var(--md-sys-color-on-surface); }
+.empty-sub { margin: 0; max-width: 22rem; line-height: 1.45; }
+.empty-cta { margin-top: 0.6rem; }
+.empty-actions {
+  margin-top: 0.6rem; display: flex; flex-direction: column;
+  align-items: center; gap: 0.35rem;
+}
+.empty-actions .empty-cta { margin-top: 0; }
+.pending-contact { opacity: 0.6; }
+.list-meta { display: flex; flex-direction: column; align-items: flex-end; gap: 0.25rem; }
+.list-time { font-size: 0.68rem; color: var(--md-sys-color-on-surface-variant); white-space: nowrap; }
+.unread-badge {
+  position: static; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px;
+  background: var(--md-sys-color-primary); color: var(--md-sys-color-on-primary);
+}
+.has-unread [slot="headline"] { font-weight: 700; }
+
+/* presence */
+.presence-dot {
+  display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+  vertical-align: middle; flex-shrink: 0; background: var(--md-sys-color-outline);
+}
+.presence-online  { background: #2e9e4f; }
+.presence-mailbox { background: #d8a200; }
+.presence-offline { background: var(--md-sys-color-outline); }
+.presence-unknown { background: var(--md-sys-color-outline-variant); }
+#detail-titles { display: flex; flex-direction: column; justify-content: center; min-width: 0; flex: 1; }
+#detail-titles h2 { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.detail-presence { font-size: 0.72rem; color: var(--md-sys-color-on-surface-variant); line-height: 1.1; }
+.detail-presence.presence-text-online { color: #2e9e4f; }
+
+/* requests */
+.request-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 0.5rem;
+  padding: 0.75rem; margin: 0.4rem 0; background: var(--md-sys-color-surface-container);
+  border-radius: var(--shape-m);
+}
+.request-row .body { margin: 0; word-break: break-word; }
+.request-actions { display: flex; gap: 0.5rem; flex-shrink: 0; }
+.danger-tonal { --md-sys-color-secondary-container: var(--md-sys-color-error-container); --md-sys-color-on-secondary-container: var(--md-sys-color-on-error-container); }
+#duress-ok { color: var(--md-sys-color-primary); }
+.accept-notice {
+  margin: 0.6rem 0.75rem; padding: 0.6rem 0.75rem; border-radius: var(--shape-md, 12px);
+  background: var(--md-sys-color-secondary-container); color: var(--md-sys-color-on-secondary-container);
+}
+/* Desktop-shell notice: a bar across the top of the unlocked view.
+   In flow, not floating. A floating bar is the obvious choice and the wrong
+   one here — anywhere near the bottom it covers the compose field, and the
+   whole point of this message is that it appears unprompted, so it would
+   land on the text box of someone who was mid-conversation.
+   #view-unlocked is a column (see above), so this simply pushes the shell
+   down and adds no page height when hidden. */
+.desktop-notice {
+  flex-shrink: 0; display: flex; align-items: center; gap: 0.5rem;
+  margin: 0.5rem 0.5rem 0; padding: 0.5rem 0.5rem 0.5rem 0.9rem;
+  border-radius: var(--shape-md, 12px);
+  background: var(--md-sys-color-inverse-surface); color: var(--md-sys-color-inverse-on-surface);
+}
+.desktop-notice .body { flex: 1; margin: 0; }
+.desktop-notice md-text-button { flex-shrink: 0; --md-text-button-label-text-color: var(--md-sys-color-inverse-primary); }
+.section-head { margin: 1rem 0.75rem 0.35rem; font-size: 0.8rem; font-weight: 600; color: var(--md-sys-color-on-surface-variant); }
+.relay-req-row { flex-direction: column; align-items: stretch; }
+.relay-req-row .request-actions { justify-content: flex-end; margin-top: 0.4rem; }
+.relay-offer {
+  align-self: flex-end; margin: 0.1rem 0.2rem; padding: 0.3rem 0.7rem; cursor: pointer;
+  border: 1px solid var(--md-sys-color-primary); background: transparent; color: var(--md-sys-color-primary);
+  border-radius: 999px; font-size: 0.75rem;
+}
+.relay-offer:hover { background: color-mix(in srgb, var(--md-sys-color-primary) 10%, transparent); }
+
+/* you tab */
+.you-section { display: flex; flex-direction: column; gap: 0.75rem; margin-bottom: 1rem; }
+/* Group the long You scroll into labeled sections (item 7). Cards, ids and forms
+   are unchanged — each section is just a wrapper + a reused .section-head overline
+   (same style as the Requests tab, for app-wide consistency). Tight intra-group
+   gap vs the looser #tab-you gap between groups gives the visual rhythm; the
+   scoped margin just hugs each header to the cards below it. */
+.you-group { display: flex; flex-direction: column; gap: 2rem; }
+.you-group .section-head { margin: 0.25rem 0.35rem 0; }
+.btn-row { display: flex; align-items: center; gap: 0.25rem; flex-wrap: wrap; }
+/* Account actions: Copy + QR Code buttons side by side */
+.account-actions { margin-top: 0.5rem; }
+.account-actions .action-btn { flex: 1; min-width: 0; }
+#qr-box { text-align: center; margin-top: 0.5rem; }
+#qr-box img { background: #fff; padding: 8px; border-radius: var(--shape-m); max-width: 100%; height: auto; }
+/* Both QR codes are tappable to open fullscreen for easier scanning. */
+#qr-img, #link-qr { cursor: zoom-in; }
+.theme-row { display: flex; gap: 0.4rem; }
+.mode-btn {
+  flex: 1; border: 1px solid var(--md-sys-color-outline-variant); background: transparent;
+  color: var(--md-sys-color-on-surface); border-radius: 999px; padding: 0.45rem; cursor: pointer; font-size: 0.85rem;
+}
+.mode-btn.active { background: var(--md-sys-color-secondary-container); color: var(--md-sys-color-on-secondary-container); border-color: transparent; }
+.swatches { display: flex; gap: 0.6rem; flex-wrap: wrap; margin-top: 0.25rem; }
+.swatch { position: relative; width: 34px; height: 34px; border-radius: 50%; border: 2px solid transparent; cursor: pointer; padding: 0; transition: box-shadow 180ms cubic-bezier(0.2, 0, 0, 1); }
+/* Selected accent: a Primary ring floating off the swatch (surface gap) + a
+   crisp white checkmark, replacing the old on-surface outline ring. */
+.swatch.active { border-color: transparent; box-shadow: 0 0 0 2px var(--md-sys-color-surface), 0 0 0 4px var(--md-sys-color-primary); }
+.swatch.active::after {
+  content: ""; position: absolute; left: 50%; top: 46%;
+  width: 6px; height: 11px; border: solid #fff; border-width: 0 2.5px 2.5px 0;
+  transform: translate(-50%, -50%) rotate(45deg);
+}
+.row-between { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; }
+
+/* devices / pairing */
+.device-row { display: flex; align-items: center; gap: 0.5rem; padding: 0.35rem 0; font-size: 0.9rem; }
+#link-new-box { align-items: center; text-align: center; }
+#link-new-box img { background: #fff; padding: 8px; border-radius: var(--shape-m); max-width: 100%; height: auto; }
+.pair-code { display: block; word-break: break-all; font-size: 0.72rem; background: var(--md-sys-color-surface-container-high); padding: 0.5rem; border-radius: var(--shape-s); }
+
+/* logout / danger */
+.danger-outline {
+  width: 100%; cursor: pointer; padding: 0.7rem 1rem;
+  display: inline-flex; align-items: center; justify-content: center; gap: 0.5rem;
+  border: 1px solid var(--md-sys-color-error); background: transparent;
+  color: var(--md-sys-color-error); font-size: 0.9rem; font-weight: 600;
+  border-radius: var(--shape-full);
+  transition: background 0.15s ease, transform 0.1s ease;
+}
+.danger-outline .icon { width: 18px; height: 18px; }
+.danger-outline:hover { background: color-mix(in srgb, var(--md-sys-color-error) 8%, transparent); }
+.danger-outline:active { transform: scale(0.97); }
+.danger-box { border: 1px solid var(--md-sys-color-error); }
+.danger-box .label { color: var(--md-sys-color-error); font-weight: 600; }
+.danger-fill { --md-filled-button-container-color: var(--md-sys-color-error); --md-filled-button-label-text-color: var(--md-sys-color-on-error); }
+/* Danger Zone card */
+.danger-zone {
+  margin-top: 1rem;
+  padding: 1rem;
+  background: var(--md-sys-color-surface-container-high);
+  border-radius: var(--shape-m);
+}
+.danger-zone-header {
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--md-sys-color-error);
+  margin-bottom: 0.75rem;
+}
+.danger-zone .danger-outline {
+  font-size: 0.82rem;
+  padding: 0.6rem 1rem;
+}
+
+/* add-person overlay */
+#add-screen { padding: 1rem; }
+.find-result { margin-top: 0.5rem; }
+.find-result .body { margin: 0 0 0.6rem; word-break: break-word; }
+
+/* chat */
+#chat-screen { padding: 0; }
+.messages { flex: 1; overflow-y: auto; overflow-x: hidden; display: flex; flex-direction: column; gap: 0.35rem; padding: 1rem; position: relative; }
+.bubble {
+  max-width: 82%; padding: 0.5rem 0.75rem; border-radius: var(--shape-l);
+  font-size: 0.92rem; line-height: 1.35; word-wrap: break-word; white-space: pre-wrap;
+}
+.bubble.in { align-self: flex-start; background: var(--md-sys-color-surface-container-high); color: var(--md-sys-color-on-surface); border-bottom-left-radius: 4px; }
+.bubble.out { align-self: flex-end; background: var(--md-sys-color-primary); color: var(--md-sys-color-on-primary); border-bottom-right-radius: 4px; }
+.bubble.failed { opacity: 0.7; outline: 1px solid var(--md-sys-color-error); }
+.bubble-row { display: flex; flex-direction: column; max-width: 82%; }
+.bubble-row.in { align-self: flex-start; align-items: flex-start; }
+.bubble-row.out { align-self: flex-end; align-items: flex-end; }
+.bubble-row .bubble { max-width: 100%; }
+.bubble-time { font-size: 0.66rem; color: var(--md-sys-color-on-surface-variant); margin: 0.1rem 0.3rem 0; }
+.msg-delete {
+  align-self: flex-end; margin: 0.1rem 0.2rem 0.2rem; padding: 0.15rem 0.5rem; cursor: pointer;
+  border: 0; background: transparent; color: var(--md-sys-color-on-surface-variant);
+  font-size: 0.7rem; border-radius: 999px;
+}
+.msg-delete:hover { background: color-mix(in srgb, var(--md-sys-color-error) 12%, transparent); color: var(--md-sys-color-error); }
+.msg-status { align-self: flex-end; font-size: 0.7rem; color: var(--md-sys-color-on-surface-variant); margin: -0.15rem 0.2rem 0.1rem; }
+.msg-status.error { color: var(--md-sys-color-error); }
+.mailbox-note { align-self: center; text-align: center; margin: 0.4rem 1rem; padding: 0.35rem 0.75rem; background: var(--md-sys-color-surface-container-high); border-radius: var(--shape-m); }
+/* Opaque full-width bar pays the safe-area inset (so the gesture region below the
+   pill is filled with surface, not whatever is behind); the pill floats inside. */
+.compose {
+  flex-shrink: 0;
+  padding: 0.45rem calc(0.6rem + var(--sar)) calc(0.45rem + var(--sab)) calc(0.6rem + var(--sal));
+  background: var(--md-sys-color-surface);
+  position: relative; z-index: 120;
+}
+/* Single outlined pill: attach (leading) + input + send (trailing) share one
+   rounded outline, instead of three loose parts. */
+.compose-pill {
+  display: flex; align-items: flex-end; gap: 0.15rem;
+  padding: 0.2rem 0.2rem 0.2rem 0.4rem;
+  border: 1px solid var(--md-sys-color-outline);
+  border-radius: 1.5rem;
+  background: var(--md-sys-color-surface-container-high);
+  transition: border-color 0.15s ease;
+}
+.compose-pill:focus-within { border-color: var(--md-sys-color-primary); }
+.compose-input {
+  flex: 1; min-width: 0; border: 0; background: transparent; outline: none;
+  color: var(--md-sys-color-on-surface); font: inherit; font-size: 0.95rem;
+  padding: 0.55rem 0.4rem; line-height: 1.3;
+  resize: none; overflow-y: hidden; max-height: 150px;
+  field-sizing: content;
+}
+.compose-input::placeholder { color: var(--md-sys-color-on-surface-variant); }
+.send-btn {
+  flex-shrink: 0; width: 44px; height: 44px; border: 0; border-radius: 50%; cursor: pointer;
+  background: var(--md-sys-color-primary); color: var(--md-sys-color-on-primary); display: grid; place-items: center;
+  transition: transform 0.1s ease;
+}
+.send-btn:active { transform: scale(0.92); }
+.send-btn:disabled { background: var(--md-sys-color-surface-container-highest); color: var(--md-sys-color-on-surface-variant); cursor: default; }
+#send-error { margin: 0 0.75rem; }
+
+/* Chat overflow menu + contact info */
+.appbar-end { margin-left: auto; }
+.menu {
+  position: absolute; top: calc(50px + var(--sat)); right: calc(8px + var(--sar)); z-index: 20;
+  background: var(--md-sys-color-surface-container-high);
+  border-radius: var(--shape-m); box-shadow: var(--elev-2);
+  padding: 0.35rem; min-width: 210px; display: flex; flex-direction: column;
+}
+.menu button {
+  border: 0; background: transparent; text-align: left; padding: 0.65rem 0.75rem;
+  color: var(--md-sys-color-on-surface); border-radius: var(--shape-s); cursor: pointer; font-size: 0.9rem;
+}
+.menu button:hover { background: color-mix(in srgb, var(--md-sys-color-on-surface) 10%, transparent); }
+.menu button.danger { color: var(--md-sys-color-error); }
+.info-body { padding: 1.25rem; }
+
+/* ---------- groups ---------- */
+/* Segmented toggle (add-screen person/group, policy switch). */
+.seg-toggle {
+  display: flex; gap: 0.25rem; padding: 0.2rem; margin: 0 0 0.75rem;
+  background: var(--md-sys-color-surface-container-high); border-radius: var(--shape-m);
+}
+.seg {
+  flex: 1; border: 0; background: transparent; color: var(--md-sys-color-on-surface-variant);
+  padding: 0.65rem 0.6rem; border-radius: calc(var(--shape-m) - 0.2rem); cursor: pointer; font: inherit;
+  min-height: 40px;
+}
+.seg.active { background: var(--md-sys-color-primary-container); color: var(--md-sys-color-on-primary-container); }
+.policy-toggle { margin: 0.3rem 0 0; }
+.policy-row { margin: 0.75rem 0; }
+
+/* Group row avatar in the conversation list. */
+.group-avatar {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 1.5rem; height: 1.5rem; border-radius: 50%; vertical-align: middle;
+  background: var(--md-sys-color-primary-container); color: var(--md-sys-color-on-primary-container);
+}
+.group-avatar .icon { width: 1rem; height: 1rem; }
+
+/* ---- Avatar (profile picture) component ---- */
+/* Wrapper positions an optional presence corner-dot over a circular avatar. */
+.avatar-wrap { position: relative; display: inline-flex; flex-shrink: 0; vertical-align: middle; overflow: visible; }
+.avatar {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 1.75rem; height: 1.75rem; border-radius: 50%; overflow: hidden;
+  background: var(--md-sys-color-primary-container); color: var(--md-sys-color-on-primary-container);
+  font-size: 0.7rem; font-weight: 700; line-height: 1; letter-spacing: 0.02em;
+  user-select: none;
+}
+.avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.avatar-initials { text-transform: uppercase; }
+/* Presence dot overlaid on the avatar's lower-right, ringed by the surface so it
+   reads against any picture. */
+.presence-corner {
+  position: absolute; right: -1px; bottom: -1px; width: 10px; height: 10px;
+  border-radius: 50%; background: var(--md-sys-color-outline);
+  box-shadow: 0 0 0 2px var(--md-sys-color-surface);
+}
+/* Two-class specificity so the state colour wins over the base above regardless
+   of source order. */
+.presence-corner.presence-online  { background: #2e9e4f; }
+.presence-corner.presence-mailbox { background: #d8a200; }
+.presence-corner.presence-offline { background: var(--md-sys-color-outline); }
+.presence-corner.presence-unknown { background: var(--md-sys-color-outline-variant); }
+.contact-headline { display: inline-flex; align-items: center; gap: 0.5rem; min-width: 0; }
+
+/* Chat header avatar (a touch larger, no presence — the presence line sits below). */
+.detail-avatar .avatar { width: 2rem; height: 2rem; font-size: 0.75rem; }
+.detail-avatar { margin-right: 0.5rem; display: inline-flex; align-items: center; }
+
+/* Add-someone preview: face beside the name. */
+.find-identity { display: flex; align-items: center; gap: 0.75rem; }
+.find-identity .avatar { width: 2.5rem; height: 2.5rem; font-size: 0.9rem; }
+
+/* Settings: large avatar with an edit badge and a Remove control. */
+.profile-avatar-row { display: flex; align-items: center; gap: 1rem; margin-bottom: 0.75rem; }
+.avatar-lg .avatar { width: 4rem; height: 4rem; font-size: 1.5rem; }
+.avatar-picker {
+  position: relative; border: none; background: none; padding: 0; cursor: pointer;
+  border-radius: 50%; -webkit-tap-highlight-color: transparent;
+}
+.avatar-picker:focus-visible { outline: 2px solid var(--md-sys-color-primary); outline-offset: 3px; }
+.avatar-edit-badge {
+  position: absolute; right: -2px; bottom: -2px; width: 1.4rem; height: 1.4rem;
+  display: inline-flex; align-items: center; justify-content: center; border-radius: 50%;
+  background: var(--md-sys-color-primary); color: var(--md-sys-color-on-primary);
+  box-shadow: 0 0 0 2px var(--md-sys-color-surface);
+}
+.avatar-edit-badge .icon { width: 0.85rem; height: 0.85rem; }
+.stack-tight { display: flex; flex-direction: column; gap: 0.15rem; }
+.avatar-hint { font-size: 0.8rem; }
+
+/* Author label above an inbound group bubble. */
+.bubble-author { margin: 0 0.3rem 0.1rem; }
+
+/* Member list in the group info pane. */
+.section-label { display: block; margin: 0.9rem 0 0.4rem; }
+.member-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 0.5rem;
+  padding: 0.6rem 0.75rem; margin: 0.3rem 0; background: var(--md-sys-color-surface-container);
+  border-radius: var(--shape-m);
+}
+.member-row .body { margin: 0; word-break: break-word; }
+.member-id { display: flex; align-items: center; gap: 0.5rem; min-width: 0; }
+.member-id .body { min-width: 0; overflow-wrap: anywhere; }
+.member-actions { display: flex; gap: 0.15rem; flex-shrink: 0; flex-wrap: wrap; justify-content: flex-end; }
+/* Error-coloured text button. The label token gets a CONCRETE colour per theme
+   rather than var(--md-sys-color-error): the desktop Wails WebKit doesn't resolve
+   a var()-referencing-a-var() across the button's shadow boundary, so on desktop
+   the label fell back to the default colour instead of red. Values mirror the
+   theme's --md-sys-color-error (light #ba1a1a, dark #ffb4ab). */
+.danger-text { --md-text-button-label-text-color: #ba1a1a; color: #ba1a1a; }
+:root[data-theme="dark"] .danger-text { --md-text-button-label-text-color: #ffb4ab; color: #ffb4ab; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .danger-text { --md-text-button-label-text-color: #ffb4ab; color: #ffb4ab; }
+}
+
+/* ---------- QR camera scan overlay ---------- */
+.scan-overlay {
+  position: fixed; inset: 0; z-index: 100; background: #000;
+  display: flex; align-items: center; justify-content: center;
+}
+.scan-overlay[hidden] { display: none; }
+#scan-video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+/* A centred viewfinder square so the user knows where to aim. */
+.scan-frame {
+  position: relative; width: min(70vw, 60vh); aspect-ratio: 1;
+  border: 3px solid #fff; border-radius: var(--shape-l);
+  box-shadow: 0 0 0 100vmax rgba(0, 0, 0, 0.45);
+}
+.scan-hint {
+  position: absolute; left: 0; right: 0; bottom: calc(6rem + var(--sab));
+  text-align: center; color: #fff; margin: 0; padding: 0 1.5rem;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
+}
+.scan-cancel {
+  position: absolute; bottom: calc(2rem + var(--sab)); left: 50%; transform: translateX(-50%);
+  border: 0; border-radius: 999px; padding: 0.7rem 1.6rem; cursor: pointer;
+  background: rgba(255, 255, 255, 0.92); color: #000; font: inherit; font-weight: 600;
+}
+
+/* ---------- photo attachments ---------- */
+.attach-btn {
+  border: 0; background: transparent; color: var(--md-sys-color-on-surface-variant);
+  border-radius: 50%; width: 2.5rem; height: 2.5rem; flex-shrink: 0; cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.attach-btn:hover { background: color-mix(in srgb, var(--md-sys-color-on-surface) 8%, transparent); }
+.attach-btn[disabled] { opacity: 0.5; pointer-events: none; }
+
+/* An image bubble is just a frame around the picture. */
+.bubble.image { padding: 3px; overflow: hidden; }
+.msg-image {
+  display: block; max-width: min(62vw, 320px); max-height: 320px; width: auto; height: auto;
+  border-radius: calc(var(--shape-m) - 2px); cursor: pointer; object-fit: cover;
+}
+/* Skeleton loader placeholder while image is fetching */
+.msg-image.skeleton {
+  width: 200px; height: 150px;
+  background: linear-gradient(90deg, var(--md-sys-color-surface-container-high) 25%, var(--md-sys-color-surface-container-highest) 50%, var(--md-sys-color-surface-container-high) 75%);
+  background-size: 200% 100%;
+  animation: skeleton-shimmer 1.5s infinite;
+  pointer-events: none;
+}
+@keyframes skeleton-shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+.msg-image.img-missing {
+  width: 180px; height: 120px; cursor: default;
+  background: var(--md-sys-color-surface-container-highest);
+  border: 1px dashed var(--md-sys-color-outline);
+  position: relative;
+}
+.msg-image.img-missing::after {
+  content: "Photo unavailable\A on this device"; white-space: pre; text-align: center;
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  font-size: 0.75rem; color: var(--md-sys-color-on-surface-variant); padding: 0 0.5rem;
+}
+/* Group image: a blurry thumbnail with a Download button until the full is local.
+   The small thumbnail is already low-res; the blur makes clear it's a preview. */
+.group-image { position: relative; display: inline-block; line-height: 0; }
+.msg-image.blurred { filter: blur(5px); cursor: default; }
+.img-download {
+  position: absolute; inset: 0; margin: auto; width: fit-content; height: fit-content;
+  padding: 0.4rem 0.9rem; border: none; border-radius: 999px; cursor: pointer;
+  font: inherit; font-size: 0.8rem; font-weight: 600;
+  background: rgba(0, 0, 0, 0.6); color: #fff;
+}
+.img-download:disabled { opacity: 0.7; cursor: default; }
+
+/* Fullscreen viewer. */
+.image-viewer {
+  position: fixed; inset: 0; z-index: 110; background: rgba(0, 0, 0, 0.92);
+  display: flex; align-items: center; justify-content: center; padding: var(--sat) 1rem var(--sab);
+}
+.image-viewer[hidden] { display: none; }
+/* Override the base rule's align/justify:center — in a column flex that would
+   shrink the top bar to its content width and strand its buttons at centre. */
+.image-viewer { flex-direction: column; align-items: stretch; justify-content: flex-start; padding: 0; }
+.image-viewer-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: 0.5rem;
+  padding: calc(var(--sat) + 0.4rem) 0.6rem 0.4rem; flex: 0 0 auto; z-index: 2;
+}
+.iv-actions { display: flex; gap: 0.25rem; }
+.iv-btn {
+  display: grid; place-items: center; width: 44px; height: 44px; border: none;
+  border-radius: var(--shape-full); background: transparent; color: #fff; cursor: pointer;
+}
+.iv-btn:active { background: rgba(255, 255, 255, 0.16); }
+.iv-btn .icon { width: 24px; height: 24px; fill: currentColor; }
+.image-viewer-stage {
+  flex: 1; min-height: 0; width: 100%; overflow: hidden; touch-action: none;
+  display: flex; align-items: center; justify-content: center;
+}
+#image-viewer-img {
+  max-width: 100%; max-height: 100%; object-fit: contain;
+  transform-origin: 0 0; will-change: transform; user-select: none; -webkit-user-drag: none;
+}
+.iv-note {
+  position: absolute; left: 50%; bottom: calc(var(--sab) + 1.2rem); transform: translateX(-50%);
+  margin: 0; padding: 0.5rem 1rem; border-radius: var(--shape-full);
+  background: rgba(0, 0, 0, 0.75); color: #fff; font-size: 0.85rem; z-index: 3;
+}
+.iv-note[hidden] { display: none; }
+
+/* Floating "jump to newest" button, shown when the reader scrolls up off the
+   bottom of a chat (item 1). Sits above the composer, bottom-right. */
+.scroll-bottom-btn {
+  position: absolute; right: 1rem; bottom: 5rem; z-index: 6;
+  width: 44px; height: 44px; border: none; border-radius: var(--shape-full); cursor: pointer;
+  display: grid; place-items: center;
+  background: var(--md-sys-color-secondary-container); color: var(--md-sys-color-on-secondary-container);
+  box-shadow: var(--elev-2); transition: opacity 0.18s ease, transform 0.18s var(--spring-emph);
+}
+.scroll-bottom-btn[hidden] { display: none; }
+.scroll-bottom-btn:active { transform: scale(0.92); }
+.scroll-bottom-btn .icon { width: 24px; height: 24px; fill: currentColor; }
+
+/* ---- message context menu & reaction bar (anchored popovers) ---- */
+.msg-menu {
+  position: fixed; z-index: 120;
+  min-width: 200px; max-width: 280px;
+  padding: 0.4rem;
+  border-radius: var(--shape-l);
+  background: var(--md-sys-color-surface-container-high);
+  box-shadow: var(--elev-3);
+  display: flex; flex-direction: column;
+  animation: popover-in 0.15s ease;
+}
+.msg-menu[hidden] { display: none; }
+@keyframes popover-in { from { opacity: 0; transform: scale(0.92); } to { opacity: 1; transform: scale(1); } }
+.msg-menu-item {
+  display: flex; align-items: center; gap: 0.75rem; width: 100%; min-height: 44px;
+  padding: 0.6rem 0.75rem; border: none; border-radius: var(--shape-s); cursor: pointer;
+  background: transparent; color: var(--md-sys-color-on-surface); font: inherit; font-size: 0.9rem; text-align: left;
+}
+.msg-menu-item:active { background: var(--md-sys-color-secondary-container); }
+.msg-menu-item[hidden] { display: none; }
+.msg-menu-item .icon { width: 18px; height: 18px; fill: currentColor; flex: 0 0 auto; }
+.msg-menu-item.danger { color: var(--md-sys-color-error); }
+.menu-divider { height: 1px; background: var(--md-sys-color-outline-variant); margin: 0.25rem 0; }
+/* Selected bubble: subtle tint, no harsh outline or scale */
+.bubble-row.selected .bubble {
+  background-image: linear-gradient(
+    color-mix(in srgb, var(--md-sys-color-primary) 8%, transparent),
+    color-mix(in srgb, var(--md-sys-color-primary) 8%, transparent));
+}
+/* Multi-select mode: bubble rows get a circular checkbox */
+.bubble-row { position: relative; }
+.select-check {
+  display: none; position: absolute; top: -4px; right: -4px;
+  width: 22px; height: 22px; border-radius: 50%;
+  background: var(--md-sys-color-primary); color: #fff;
+  font-size: 13px; z-index: 2;
+  border: 2px solid var(--md-sys-color-surface);
+  box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+}
+.bubble-row.selecting .select-check { display: grid; place-items: center; }
+.bubble-row.selected .select-check::after { content: "✓"; font-weight: 700; }
+
+/* Selection toolbar — appears at top of chat when multi-select is active */
+.select-bar {
+  position: sticky; top: 0; z-index: 50;
+  display: flex; align-items: center; gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  background: var(--md-sys-color-primary-container);
+  color: var(--md-sys-color-on-primary-container);
+  border-radius: var(--shape-m);
+  margin-bottom: 0.5rem;
+}
+.select-bar .select-count {
+  font-weight: 600; font-size: 0.9rem; flex: 1;
+}
+.select-bar button {
+  border: none; background: transparent; cursor: pointer;
+  color: inherit; padding: 0.4rem; border-radius: var(--shape-full);
+  display: flex; align-items: center; justify-content: center;
+}
+.select-bar button:active { background: color-mix(in srgb, currentColor 12%, transparent); }
+.select-bar button .icon { width: 20px; height: 20px; }
+.select-bar[hidden] { display: none; }
+.select-avatar { width: 24px; height: 24px; border-radius: 50%; flex-shrink: 0; }
+.select-name { font-weight: 500; font-size: 0.85rem; margin-right: 0.25rem; }
+
+/* Bubbles suppress the WebView's native long-press text-selection so our own
+   long-press menu (item 3) is the only thing that fires. This trades away
+   tap-to-select-text, which native messengers also forgo in favour of a menu. */
+.bubble-row { -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; }
+/* Briefly highlight a message jumped to from a reply quote. */
+.bubble-row.flash .bubble { animation: bubble-flash 0.9s ease; }
+@keyframes bubble-flash {
+  0%, 100% { background-color: var(--md-sys-color-surface-container-high); }
+  30% { background-color: var(--md-sys-color-secondary-container); }
+}
+
+/* Emoji reaction quick-picker. */
+.react-bar {
+  position: fixed; z-index: 121; display: flex; gap: 0.15rem; padding: 0.3rem;
+  border-radius: var(--shape-full); background: var(--md-sys-color-surface-container-high);
+  box-shadow: var(--elev-2); animation: menu-pop 0.16s var(--spring-emph);
+}
+.react-bar[hidden] { display: none; }
+.react-bar button {
+  width: 48px; height: 48px; border: none; border-radius: var(--shape-full);
+  background: transparent; font-size: 1.55rem; cursor: pointer; line-height: 1;
+}
+.react-bar button:active { background: var(--md-sys-color-secondary-container); }
+/* The "+" custom-emoji button reads as a control, not an emoji. */
+.react-bar button.react-more { font-size: 1.4rem; color: var(--md-sys-color-on-surface-variant); }
+/* Expanded state (after tapping "+"): a wrapped grid of the extended emoji set. */
+.react-bar.expanded {
+  flex-wrap: wrap; max-width: 336px; border-radius: var(--shape-xl); gap: 0.1rem;
+}
+.react-bar.expanded button { width: 44px; height: 44px; font-size: 1.4rem; }
+/* Enlarge reaction grid targets on tablet/desktop for better touch accessibility */
+@media (min-width: 900px) {
+  .react-bar.expanded { max-width: 420px; }
+  .react-bar.expanded button { width: 52px; height: 52px; font-size: 1.6rem; }
+}
+
+/* Reaction chips shown under a bubble (M3 Assist Chip style). */
+.reactions { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-top: 0.25rem; }
+.reaction-chip {
+  display: inline-flex; align-items: center; gap: 0.3rem; padding: 0.35rem 0.75rem;
+  border-radius: var(--shape-full); background: var(--md-sys-color-surface);
+  border: 1px solid var(--md-sys-color-outline-variant); font-size: 0.85rem; cursor: pointer;
+  min-height: 32px; box-shadow: 0 1px 2px rgba(0,0,0,0.08);
+  transition: background 0.15s ease, transform 0.1s ease;
+}
+.reaction-chip:active { transform: scale(0.95); }
+.reaction-chip.mine { background: var(--md-sys-color-secondary-container); border-color: transparent; }
+.reaction-chip .count { font-size: 0.75rem; color: var(--md-sys-color-on-surface-variant); }
+
+/* Quoted reply-context, both in the bubble (rendered) and above the composer
+   (the pending reply target). */
+.reply-context {
+  display: flex; align-items: center; gap: 0.5rem; padding: 0.5rem 0.75rem;
+  border-left: 3px solid var(--md-sys-color-primary); margin: 0 0.75rem;
+  background: var(--md-sys-color-surface-container-high); border-radius: 0 var(--shape-s) var(--shape-s) 0;
+}
+.reply-context[hidden] { display: none; }
+.reply-context-body { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.reply-context-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.reply-context-cancel {
+  border: none; background: transparent; color: var(--md-sys-color-on-surface-variant);
+  font-size: 1rem; cursor: pointer; padding: 0.25rem; line-height: 1;
+}
+.bubble-quote {
+  display: block; padding: 0.3rem 0.5rem; margin-bottom: 0.3rem; border-radius: var(--shape-s);
+  border-left: 2px solid currentColor; opacity: 0.75; font-size: 0.85rem;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%;
+}
+
+/* Forward picker list. */
+.forward-list { display: flex; flex-direction: column; gap: 0.15rem; max-height: 50vh; overflow-y: auto; margin: 0.5rem 0; }
+.forward-item {
+  display: flex; align-items: center; gap: 0.6rem; padding: 0.6rem 0.5rem; width: 100%;
+  border: none; border-radius: var(--shape-s); background: transparent; cursor: pointer;
+  font: inherit; font-size: 0.95rem; color: var(--md-sys-color-on-surface); text-align: left;
+}
+.forward-item:active { background: var(--md-sys-color-secondary-container); }
+
+/* Reduced motion: keep the Expressive shapes, drop the spring transforms so the
+   press/indicator settle instantly instead of overshooting. */
+@media (prefers-reduced-motion: reduce) {
+  .navitem::before, .navitem .icon,
+  md-filled-button, md-filled-tonal-button, md-outlined-button, md-text-button,
+  .send-btn, .fab, .seg, .mode-btn, .img-download, .relay-offer {
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ---- Tor status pill ---- */
+.tor-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  height: 28px;
+  padding: 0 0.65rem;
+  border-radius: var(--shape-full);
+  font-size: 0.78rem;
+  font-weight: 500;
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.2s ease, color 0.2s ease;
+  white-space: nowrap;
+  flex-shrink: 0;
+  position: relative;
+  overflow: hidden;
+  max-width: 120px;
+}
+.pill-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Spacer pushes pill + search to the right */
+.header-spacer { flex: 1; }
+/* 8dp gap between pill and search icon */
+.header-gap { width: 8px; flex-shrink: 0; }
+/* Hide gap when search is hidden */
+.header-action[hidden] + .header-gap,
+.header-gap:has(+ .header-action[hidden]) { display: none; }
+
+/* State colours */
+.tor-pill.connecting {
+  background: var(--md-sys-color-secondary-container);
+  color: var(--md-sys-color-on-secondary-container);
+}
+.tor-pill.online {
+  background: var(--md-sys-color-primary-container);
+  color: var(--md-sys-color-on-primary-container);
+}
+.tor-pill.stalled {
+  background: var(--md-sys-color-error-container);
+  color: var(--md-sys-color-on-error-container);
+}
+.tor-pill.offline {
+  background: var(--md-sys-color-surface-variant);
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+/* Icon area: exactly one of the four icons shows per state */
+.pill-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  position: relative;
+  z-index: 1;
+}
+.pill-icon svg { width: 14px; height: 14px; }
+
+/* Spinner animation */
+.pill-spinner {
+  animation: pill-spin 1s linear infinite;
+}
+@keyframes pill-spin {
+  to { transform: rotate(360deg); }
+}
+/* Hide spinner when stalled/offline/online */
+.tor-pill.online .pill-spinner,
+.tor-pill.stalled .pill-spinner,
+.tor-pill.offline .pill-spinner { display: none; }
+
+/* Only show the correct icon per state */
+.tor-pill .pill-check,
+.tor-pill .pill-warn,
+.tor-pill .pill-offline { display: none; }
+.tor-pill.online .pill-check { display: inline; color: var(--md-sys-color-on-primary-container); }
+.tor-pill.stalled .pill-warn { display: inline; }
+.tor-pill.offline .pill-offline { display: inline; }
+
+/* Label text */
+.pill-label {
+  line-height: 1;
+  position: relative;
+  z-index: 1;
+}
+
+/* Progress bar at the bottom of the pill */
+.pill-bar {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  background: transparent;
+  overflow: hidden;
+  border-radius: 0 0 var(--shape-full) var(--shape-full);
+  z-index: 0;
+}
+.pill-bar-fill {
+  display: block;
+  height: 100%;
+  width: 0%;
+  border-radius: inherit;
+  transition: width 0.4s ease;
+}
+/* Connecting: animated indeterminate sweep */
+.tor-pill.connecting .pill-bar-fill {
+  background: currentColor;
+  opacity: 0.45;
+  width: 100%;
+  animation: pill-bar-sweep 1.6s ease-in-out infinite;
+  transform-origin: left;
+}
+@keyframes pill-bar-sweep {
+  0%   { transform: translateX(-100%); }
+  50%  { transform: translateX(0%); }
+  100% { transform: translateX(100%); }
+}
+/* Online: bar hidden */
+.tor-pill.online .pill-bar { display: none; }
+/* Stalled: bar hidden */
+.tor-pill.stalled .pill-bar { display: none; }
+/* Offline: bar hidden */
+.tor-pill.offline .pill-bar { display: none; }
+
+/* Respect reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  .pill-spinner { animation: none; }
+  .pill-bar-fill { animation: none; }
+}
+
+/* ---- Tor log bottom sheet ---- */
+.tor-log-dialog {
+  /* Reset dialog defaults */
+  border: none;
+  padding: 0;
+  background: transparent;
+  max-width: 100%;
+  width: 100%;
+  max-height: 100%;
+  overflow: visible;
+}
+.tor-log-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.4);
+}
+.tor-log-sheet {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 72vh;
+  background: var(--md-sys-color-surface-container-low, var(--md-sys-color-surface));
+  color: var(--md-sys-color-on-surface);
+  border-radius: var(--shape-xl) var(--shape-xl) 0 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  box-shadow: 0 -2px 16px rgba(0,0,0,0.15);
+}
+.tor-log-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--md-sys-color-outline-variant, rgba(0,0,0,0.12));
+  flex-shrink: 0;
+}
+.tor-log-title {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 500;
+}
+.tor-log-close {
+  font-size: 1.5rem;
+  line-height: 1;
+  width: 32px;
+  height: 32px;
+  border: none;
+  background: transparent;
+  color: var(--md-sys-color-on-surface-variant);
+  cursor: pointer;
+  border-radius: var(--shape-full);
+  display: grid;
+  place-items: center;
+}
+.tor-log-close:active { background: var(--md-sys-color-secondary-container); }
+.tor-log-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0.75rem 1rem;
+  margin: 0;
+  font-family: var(--md-ref-typeface-plain, 'Roboto', sans-serif);
+  font-size: 0.8rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+}
+/* Diagnostics snapshot: the status header above the (scrolling) Tor log. */
+.diag-snapshot {
+  flex-shrink: 0;
+  margin: 0;
+  padding: 0.75rem 1rem;
+  background: var(--md-sys-color-surface-container-high, var(--md-sys-color-surface));
+  color: var(--md-sys-color-on-surface);
+  font-family: var(--md-ref-typeface-plain, 'Roboto', sans-serif);
+  font-size: 0.8rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.diag-loghead {
+  flex-shrink: 0;
+  padding: 0.5rem 1rem 0.25rem;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--md-sys-color-on-surface-variant);
+  border-top: 1px solid var(--md-sys-color-outline-variant, rgba(0,0,0,0.12));
+}
+.diag-footer {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+  flex-wrap: wrap;
+  padding: 0.75rem 1rem;
+  border-top: 1px solid var(--md-sys-color-outline-variant, rgba(0,0,0,0.12));
+}
+.diag-note { flex-basis: 100%; }
+
+/* You-tab segmented sub-navigation (Profile / Preferences / Devices / Security).
+   Only the active pane's wrappers render; hidden panes collapse out entirely, so
+   each card keeps its own `hidden` state (e.g. #wipe-section, #autostart). */
+.you-tabs {
+  display: flex; gap: 0.25rem; margin: 0 0 0.5rem;
+  padding: 0.25rem; border-radius: var(--shape-full);
+  background: var(--md-sys-color-surface-container-high);
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+  flex-shrink: 0;
+}
+.you-tabs::-webkit-scrollbar { display: none; }
+.you-tab {
+  flex: 0 0 auto; min-width: 0; border: none; cursor: pointer;
+  padding: 0.55rem 0.75rem; border-radius: var(--shape-full);
+  background: transparent; color: var(--md-sys-color-on-surface-variant);
+  font: inherit; font-size: 0.82rem; font-weight: 500;
+  white-space: nowrap;
+  transition: background 0.15s, color 0.15s;
+}
+.you-tab.active {
+  background: var(--md-sys-color-secondary-container);
+  color: var(--md-sys-color-on-secondary-container);
+}
+.you-tab:focus-visible { outline: 2px solid var(--md-sys-color-primary); outline-offset: 2px; }
+#tab-you [data-you-pane] { display: none; }
+#tab-you [data-you-pane].pane-on { display: block; }
+/* The tab strip already names Devices/Security — drop the duplicate headings. */
+#tab-you [data-you-pane="devices"] .section-head,
+#tab-you [data-you-pane="security"] .section-head { display: none; }
+
+/* --- UX polish batch: help links, grouped row actions, add-screen buttons,
+   fullscreen account view --- */
+.help-link { margin: 0 0 0.4rem; --md-text-button-label-text-color: var(--md-sys-color-primary); }
+/* Group a help "?" beside an edit pencil on a settings row. */
+.row-actions { display: flex; align-items: center; gap: 0.15rem; flex: 0 0 auto; }
+/* New Chat: two prominent side-by-side actions above the paste field. */
+.add-actions { display: flex; gap: 0.5rem; }
+.add-actions > * { flex: 1 1 0; }
+.add-actions > [hidden] { display: none; }
+/* Add help text */
+.add-help { margin-bottom: 0.5rem; }
+/* Live preview card when typing an account ID */
+.find-preview {
+  display: flex; align-items: center; gap: 0.75rem; padding: 0.75rem 1rem;
+  margin-bottom: 0.5rem; animation: fade-in 0.15s ease;
+}
+.find-preview[hidden] { display: none; }
+@keyframes fade-in { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
+
+/* Fullscreen own-account view ("Show large"). A scrim with the QR + the full
+   address, large enough to read across a table. Tap the backdrop to close. */
+.account-fs {
+  position: fixed; inset: 0; z-index: 60;
+  background: var(--md-sys-color-scrim, rgba(0,0,0,0.85));
+  display: flex; align-items: center; justify-content: center; padding: 1.5rem;
+}
+.account-fs-close {
+  position: absolute; top: max(0.75rem, var(--sat, 0px)); left: 0.5rem;
+  color: #fff;
+}
+.account-fs-inner {
+  display: flex; flex-direction: column; align-items: center; gap: 1rem;
+  max-width: 26rem; width: 100%; text-align: center;
+}
+.account-fs-qr {
+  width: min(60vw, 260px); height: auto; border-radius: var(--shape-m);
+  background: #fff; padding: 10px;
+}
+.account-fs-text {
+  margin: 0; color: #fff;
+  font-family: ui-monospace, 'Roboto Mono', Menlo, monospace;
+  font-size: 1.15rem; line-height: 1.6; letter-spacing: 0.03em;
+  word-break: break-all;
+}

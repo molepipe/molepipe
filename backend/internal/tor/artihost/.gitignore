@@ -1,0 +1,3 @@
+# cargo-ndk output, produced per-ABI by android/build-aar.sh. A native build
+# artifact, not source.
+/lib/

@@ -1,0 +1,61 @@
+[package]
+name = "torhost"
+version = "0.1.0"
+edition = "2021"
+
+# torhost is the Android Tor implementation for Molepipe: a thin C-ABI shim
+# over arti-client that HOSTS the account's v3 onion service (publishing under
+# our own pre-derived key) and dials peer onion services. The Go backend links
+# it via cgo (see backend/internal/tor/artihost) and drives it through the
+# existing tor.OnionService interface, so the onion secret key never leaves
+# native memory (it is never marshalled into the JVM).
+#
+# arti-client's onion-service HOSTING API is EXPERIMENTAL and explicitly outside
+# semver guarantees, so the arti/tor-* crates are pinned to EXACT versions —
+# a caret range would let `cargo update` break the build with no code change.
+# Verified against: arti-client 0.45.0 (Arti 1.7.0 era).
+
+[lib]
+# staticlib: the .a that cgo links into the gomobile build (the A2 path).
+# rlib: lets `cargo test`/`cargo check` build normally on the host.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# onion-service-client is required to DIAL peer .onion services (TorClient::connect),
+# and additionally works around an arti-client 0.45.0 feature-gating bug: the
+# service-side launch_onion_service_with_hsid (gated onion-service-service +
+# experimental-api) uses HsIdKeypair/KeystoreSelector, but those imports are gated
+# on onion-service-client, so building the host side without the client side fails.
+# default-features = false drops arti-client's default `native-tls`, which pulls
+# openssl-sys and breaks the Android cross-compile (no OpenSSL for the target).
+# We use rustls only. The other defaults (compression, flowctl-cc) are re-added.
+arti-client = { version = "=0.45.0", default-features = false, features = ["tokio", "rustls", "compression", "flowctl-cc", "onion-service-service", "onion-service-client", "experimental-api", "keymgr"] }
+tor-hscrypto = "=0.45.0"
+tor-hsservice = "=0.45.0"
+tor-rtcompat = { version = "=0.45.0", features = ["tokio", "rustls"] }
+tor-llcrypto = "=0.45.0"
+tor-keymgr = "=0.45.0"
+futures = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time"] }
+tokio-util = { version = "0.7.19", features = ["compat"] }
+safelog = "0.9.1"
+tor-cell = "0.45.0"
+
+# arti pulls sqlite (via tor-dirmgr/rusqlite) and lzma (via the compression
+# feature). Both default to linking the SYSTEM library, which does not exist in
+# an Android app's linker namespace — libgojni.so then fails to dlopen with
+# "cannot locate symbol sqlite3_get_autocommit" / lzma_*. Force both to be
+# compiled INTO the static lib. These are direct deps only to unify the feature
+# onto the transitive crate; versions match what arti-client 0.45.0 resolves.
+rusqlite = { version = "=0.39.0", features = ["bundled"] }
+liblzma = { version = "=0.4.8", features = ["static"] }
+
+# rustls 0.23 requires the application to install a process-default CryptoProvider
+# before any TLS config is built. arti's tor-rtcompat does NOT do this outside its
+# test path, so create_bootstrapped panics (expect_failed in ClientConfig::builder)
+# — which aborts the process across the extern "C" boundary. We install ring once
+# at startup (see ensure_crypto_provider). Same rustls 0.23.x arti resolves, so the
+# process-global default is shared.
+rustls = { version = "0.23", features = ["ring"] }
+log = "0.4"
+android_logger = "0.14"

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Transcoded HEIC→JPEG photos live in cacheDir; expose that to the
+         same-app FileProvider so the WebView file input can read them.
+         The FileProvider is not exported, so only this app can access it. -->
+    <cache-path name="picked" path="." />
+</paths>

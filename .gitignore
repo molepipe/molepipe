@@ -1,0 +1,44 @@
+# Build output (anchored so it never shadows the cmd/tormsg source dir)
+/bin/
+*.exe
+/tormsg
+/tormsg-server
+/molepipe-desktop
+/molepipe-server
+/backend/tormsg
+/backend/tormsg-server
+
+# Local runtime data (encrypted identities, never commit these)
+*.enc
+# Exception: this one committed upgrade-survival fixture holds only synthetic
+# data sealed with a fixed test key (see migration_survival_test.go). Kept a
+# single explicit path, NOT a testdata/ wildcard, so the *.enc guard still
+# catches a real account file dropped into any testdata/ dir. Each future
+# fixture gets its own line here.
+!/backend/internal/chatstore/testdata/messages_v1.enc
+/data/
+.tormessenger/
+
+# Android release signing — never commit the keystore or its passwords
+keystore.properties
+*.jks
+*.keystore
+
+# Android local config — contains developer-specific SDK paths
+android/local.properties
+
+# Editor / OS cruft
+.DS_Store
+*.swp
+android/.idea/
+
+# Node tooling deps (package.json is committed; the installed tree is not)
+/node_modules/
+
+# release artifacts
+/dist/
+.aider*
+
+# Review screenshots — real account data (onion address, personal photos,
+# contact names). Kept local, never committed.
+/screenshots/

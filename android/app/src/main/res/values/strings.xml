@@ -1,0 +1,29 @@
+<resources>
+    <string name="app_name">Molepipe</string>
+
+    <!-- Foreground-service notification. Deliberately says nothing about the
+         account, contacts, or messages — same rule as the desktop tray notice. -->
+    <string name="notif_channel_name">Running</string>
+    <string name="notif_channel_desc">Keeps Molepipe running so you can receive messages.</string>
+    <string name="notif_title">Molepipe is running</string>
+    <string name="notif_text">You can receive messages. Tap to open.</string>
+    <string name="notif_stop">Stop</string>
+
+    <!-- New-message notifications. Unlike the foreground-service notice above,
+         these DO name the sender and preview the text (the user chose this) — but
+         the channel hides that content on the lock screen (VISIBILITY_PRIVATE). -->
+    <string name="msg_channel_name">Messages</string>
+    <string name="msg_channel_desc">Alerts when someone messages you.</string>
+    <string name="msg_notif_summary">New messages</string>
+    <string name="msg_notif_hidden">New message</string>
+    <!-- MessagingStyle requires a "self" Person; its name is never shown for
+         incoming-only notifications but must be non-empty. -->
+    <string name="msg_notif_self">You</string>
+
+    <!-- Friend request and group invite notifications. -->
+    <string name="req_channel_name">Requests</string>
+    <string name="req_channel_desc">Alerts for friend requests and group invites.</string>
+    <string name="notif_friend_request_text">wants to connect with you</string>
+    <string name="notif_group_invite_title">Group invite</string>
+    <string name="notif_group_invite_text">%1$s invited you to %2$s</string>
+</resources>

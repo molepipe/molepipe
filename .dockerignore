@@ -1,0 +1,16 @@
+node_modules/
+*.log
+dist/
+.env
+.env.*
+*.tmp
+*.bak
+*.orig
+*.swp
+*~
+.DS_Store
+Thumbs.db
+android/.gradle/
+android/app/build/
+android/build/
+android/local.properties
