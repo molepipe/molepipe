@@ -101,7 +101,7 @@ See [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) for the comprehensive threat 
 
 ## License
 
-License to be determined. See [`LICENSE`](LICENSE).
+See [`LICENSE.md`](LICENSE.md).
 
 ## Security Reporting
 
