@@ -227,6 +227,7 @@ fn ensure_logger() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
         ensure_ring_logger();
+        #[cfg(target_os = "android")]
         android_logger::init_once(
             android_logger::Config::default()
                 .with_max_level(log::LevelFilter::Info)

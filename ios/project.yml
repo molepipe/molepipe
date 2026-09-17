@@ -1,0 +1,42 @@
+name: Molepipe
+options:
+  bundleIdPrefix: org.molepipe
+  deploymentTarget:
+    iOS: "16.0"
+  xcodeVersion: "15.0"
+  generateEmptyDirectories: true
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    INFOPLIST_FILE: Molepipe/Info.plist
+    CODE_SIGN_ENTITLEMENTS: Molepipe/Molepipe.entitlements
+    ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+    ENABLE_BITCODE: NO
+    CLANG_ENABLE_MODULES: YES
+    DEVELOPMENT_TEAM: ""
+
+targets:
+  Molepipe:
+    type: application
+    platform: iOS
+    sources:
+      - path: Molepipe
+        excludes:
+          - "**/*.xcassets"
+    resources:
+      - path: Molepipe/Resources
+        optional: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.molepipe.molepipe
+        PRODUCT_NAME: Molepipe
+        CODE_SIGN_STYLE: Automatic
+        LD_RUNPATH_SEARCH_PATHS:
+          - "@executable_path/Frameworks"
+    dependencies:
+      - framework: Molepipe.xcframework
+        embed: true
