@@ -39,12 +39,18 @@
     <symbol id="ic-search" viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C6.01 14 4 11.99 4 9.5S6.01 5 9.5 5 15 7.01 15 9.5 12.99 14 9.5 14z"/></symbol>
     <symbol id="ic-info" viewBox="0 0 24 24"><path d="M11 7h2v2h-2V7zm0 4h2v6h-2v-6zm1-9C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/></symbol>
     <symbol id="ic-close" viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></symbol>
+    <symbol id="ic-refresh" viewBox="0 0 24 24"><path d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-8 8s3.58 8 8 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></symbol>
+    <symbol id="ic-visibility" viewBox="0 0 24 24"><path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/></symbol>
+    <symbol id="ic-backspace" viewBox="0 0 24 24"><path d="M22 3H7c-.69 0-1.23.35-1.59.88L0 12l5.41 8.11c.36.53.9.89 1.59.89h15c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-3.17 12.59L17.59 17 14 13.41 10.41 17 9 15.59 12.59 12 9 8.41 10.41 7 14 10.59 17.59 7 19 8.41 15.41 12 19 15.59z"/></symbol>
+    <symbol id="ic-check-circle" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></symbol>
+    <symbol id="ic-mail" viewBox="0 0 24 24"><path d="M20 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 4-8 5-8-5V6l8 5 8-5v2z"/></symbol>
   </svg>
 
   <div id="app">
     <div id="loading" class="center-screen">
       <img src="logo.svg" alt="Molepipe" class="loading-logo">
-      <p class="body muted" style="margin-top:1rem">Loading…</p>
+      <p id="loading-msg" class="body muted" style="margin-top:1rem">Loading…</p>
+      <md-outlined-button id="loading-retry" hidden>Retry</md-outlined-button>
     </div>
 
     <!-- No identity: onboarding wizard -->
@@ -53,7 +59,7 @@
         <!-- Progress indicator: shown only on the numbered create-flow steps. -->
         <div id="wiz-progress" class="wiz-progress" hidden>
           <div id="wiz-dots" class="wiz-dots" aria-hidden="true"></div>
-          <span id="wiz-count" class="label muted"></span>
+          <span id="wiz-count" class="label muted" aria-live="polite"></span>
         </div>
 
         <!-- STEP: welcome — what Molepipe is, and the three ways in. -->
@@ -84,7 +90,6 @@
           <div id="create-view">
           <h2 class="title">Create your account</h2>
           <p class="body muted">Pick a password. It encrypts your account on this device and never leaves your machine — so choose something you won't forget.</p>
-          <md-text-button id="pw-pin-help" type="button" class="help-link"><svg slot="icon" class="icon"><use href="#ic-info"/></svg>Password vs PIN?</md-text-button>
           <form id="create-form" autocomplete="off">
             <div class="pw-field-wrap">
               <md-filled-text-field id="create-password" type="password" label="Password" autocomplete="new-password" required></md-filled-text-field>
@@ -112,6 +117,7 @@
             <md-filled-button id="create-btn" type="submit" disabled>Create account</md-filled-button>
             <p id="create-error" class="error body" role="alert" hidden></p>
           </form>
+          <md-text-button id="pw-pin-help" type="button" class="help-link"><svg slot="icon" class="icon"><use href="#ic-info"/></svg>Password vs PIN?</md-text-button>
           <p class="privacy-footer"><svg class="icon" width="14" height="14"><use href="#ic-info"/></svg> Your password is encrypted on this device. We cannot see it.</p>
           </div>
         </section>
@@ -139,12 +145,9 @@
 
         <!-- BRANCH: recover from a phrase (returning user; outside the numbered flow). -->
         <form id="recover-form" class="wiz-step" data-step="recover" hidden autocomplete="off">
-          <div class="recover-header">
-            <md-icon-button id="to-create" aria-label="Back"><svg viewBox="0 0 24 24" width="24" height="24"><path fill="currentColor" d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg></md-icon-button>
-            <h2 class="title" style="margin:0">Recover account</h2>
-          </div>
+          <h2 class="title">Recover account</h2>
           <p class="body muted">Enter your 24-word recovery phrase and a new password.</p>
-          <md-outlined-text-field id="recover-mnemonic" type="textarea" rows="3" label="Enter all 24 words separated by spaces" required></md-outlined-text-field>
+          <md-outlined-text-field id="recover-mnemonic" type="textarea" rows="3" label="Recovery phrase" supporting-text="Enter all 24 words separated by spaces" required></md-outlined-text-field>
           <p id="recover-mnemonic-error" class="error body" role="alert" hidden></p>
           <div class="pw-field-wrap">
             <md-filled-text-field id="recover-password" type="password" label="New password" autocomplete="new-password" required></md-filled-text-field>
@@ -170,7 +173,8 @@
         </form>
         <!-- BRANCH: link to an existing device (outside the numbered flow). -->
         <form id="link-form" class="wiz-step" data-step="link" hidden autocomplete="off">
-          <p class="body muted">Link this device to an existing account. You'll need the pairing code from your other device and your recovery phrase.</p>
+          <h2 class="title">Link this device</h2>
+          <p class="body muted">Link this device to an existing account. You'll need the pairing code shown under <strong>You › Devices</strong> on your other device (this is not your friend code), plus your recovery phrase.</p>
           <md-outlined-text-field id="wiz-link-code" type="text" label="Pairing code" required></md-outlined-text-field>
           <md-outlined-text-field id="link-mnemonic" type="textarea" rows="3" label="Recovery phrase" required></md-outlined-text-field>
           <div class="pw-field-wrap">
@@ -190,7 +194,6 @@
           </ul>
           <md-filled-button id="link-btn" type="submit">Link this device</md-filled-button>
           <p id="link-error" class="error body" role="alert" hidden></p>
-          <md-text-button id="to-create-from-link">Back</md-text-button>
         </form>
         <!-- STEP 3: save the recovery phrase. -->
         <div id="phrase-view" class="wiz-step" data-step="phrase" hidden>
@@ -198,11 +201,11 @@
           <p class="body muted">These 24 words are the <strong>only</strong> way to restore your account if you lose this device or forget your password. Write them down and keep them somewhere safe — anyone who has them can open your account.</p>
           <ol id="phrase-text" class="phrase-grid" aria-label="Your 24-word recovery phrase, in order"></ol>
           <div id="phrase-actions" class="phrase-actions">
-            <md-text-button id="phrase-copy" LeadingIcon="content_copy">Copy</md-text-button>
-            <md-text-button id="phrase-download" LeadingIcon="download">Download</md-text-button>
+            <md-text-button id="phrase-copy"><svg slot="icon" class="icon"><use href="#ic-copy"/></svg>Copy</md-text-button>
+            <md-text-button id="phrase-download"><svg slot="icon" class="icon"><use href="#ic-download"/></svg>Download</md-text-button>
           </div>
           <md-filled-button id="phrase-continue">I've saved it — continue</md-filled-button>
-          <p class="body muted" style="margin-top:0.5rem;font-size:0.82rem">You can view this phrase again any time under <strong>You › Security</strong>.</p>
+          <p class="body muted phrase-note">You can view this phrase again any time under <strong>You › Security</strong>.</p>
         </div>
 
         <!-- STEP 4: how people reach you (account number). -->
@@ -210,7 +213,7 @@
           <div class="wiz-hero"><svg class="icon" aria-hidden="true"><use href="#ic-group"/></svg></div>
           <h2 class="title">How people reach you</h2>
           <ul class="wiz-points">
-            <li>Instead of a username, you have a private <strong>account number</strong> — a long code that's yours alone.</li>
+            <li>Instead of a username, you have a private <strong>friend code</strong> — a long code that's yours alone.</li>
             <li>Share it with someone you trust, in person or by showing them your QR code, and they can add you.</li>
             <li>You'll always find your number and QR code under the <strong>You</strong> tab.</li>
           </ul>
@@ -232,14 +235,15 @@
           <div class="wiz-hero"><svg class="icon" aria-hidden="true"><use href="#ic-bell"/></svg></div>
           <h2 class="title">Staying in the loop</h2>
           <ul class="wiz-points">
-            <li>Turn on <strong>notifications</strong> under the You tab so you know when a message arrives.</li>
+            <li>Turn on <strong>notifications</strong> so you know when a message arrives.</li>
             <li>Your <strong>recovery phrase</strong> is your only backup — if you lose this device, it's how you get back in. Keep it safe.</li>
           </ul>
+          <md-filled-button id="wiz-notify-enable" type="button"><svg slot="icon" class="icon"><use href="#ic-bell"/></svg>Turn on notifications</md-filled-button>
         </section>
 
         <!-- STEP 7: set a PIN. -->
         <section class="wiz-step" data-step="pin" hidden>
-          <div class="wiz-hero"><svg class="icon" aria-hidden="true"><use href="#ic-lock"/></svg></div>
+          <div class="wiz-hero"><svg class="icon" aria-hidden="true"><use href="#ic-check-circle"/></svg></div>
           <h2 class="title">Add a quick PIN?</h2>
           <p class="body muted">A PIN is an optional shortcut to unlock this device — faster than typing your full password. Your password still protects your account; the PIN never leaves this device.</p>
           <form id="wiz-pin-form" autocomplete="off" class="wiz-pin-fields">
@@ -257,13 +261,13 @@
         <section class="wiz-step" data-step="done" hidden>
           <div class="wiz-hero wiz-hero-ok"><svg class="icon" aria-hidden="true"><use href="#ic-check"/></svg></div>
           <h2 class="title">You're all set</h2>
-          <p class="body muted">Your account is ready. Add someone by their account number and say hello.</p>
+          <p class="body muted">Your account is ready. Add someone by their friend code and say hello.</p>
           <md-filled-button id="wiz-finish">Start messaging</md-filled-button>
           <div class="wiz-donate-card">
             <div class="wiz-donate-icon"><svg class="icon" width="20" height="20"><use href="#ic-heart"/></svg></div>
             <div>
-              <span class="label" style="font-weight:600">Support Molepipe</span>
-              <div class="body muted" style="font-size:0.82rem">Molepipe is free and independent. A donation helps keep it running.</div>
+              <span class="label">Support Molepipe</span>
+              <div class="body muted">Molepipe is free and independent. A donation helps keep it running.</div>
             </div>
             <button id="wiz-donate-btn" class="icon-btn wiz-donate-btn" aria-label="Donate"><svg class="icon"><use href="#ic-external"/></svg></button>
           </div>
@@ -276,9 +280,9 @@
         </div>
 
         <div id="confirm-phrase-modal" hidden class="modal-backdrop">
-          <div class="modal-card">
-            <h3 class="title">Did you save your phrase?</h3>
-            <p class="body muted">Make sure your 24 words are written down somewhere safe. You can always see them again later under <strong>You › Security</strong>, but if you lose your password <em>and</em> your phrase, the account can't be recovered.</p>
+          <div class="modal-card narrow" role="alertdialog" aria-modal="true" aria-labelledby="confirm-phrase-title" aria-describedby="confirm-phrase-msg">
+            <h2 id="confirm-phrase-title" class="modal-title">Did you save your phrase?</h2>
+            <p id="confirm-phrase-msg" class="body muted">Make sure your 24 words are written down somewhere safe. You can always see them again later under <strong>You › Security</strong>, but if you lose your password <em>and</em> your phrase, the account can't be recovered.</p>
             <div class="modal-actions">
               <md-text-button id="confirm-phrase-cancel">Go back</md-text-button>
               <md-filled-button id="confirm-phrase-ok">Yes, continue</md-filled-button>
@@ -308,6 +312,7 @@
             <div id="pin-keypad-grid" class="keypad-grid"></div>
           </div>
           <p id="pin-error" class="error body" role="alert" hidden></p>
+          <p id="pin-attempts" class="label muted" role="status" hidden></p>
           <md-text-button id="use-password-btn" type="button">Forgot PIN? Use password</md-text-button>
         </form>
         <form id="unlock-form" autocomplete="off">
@@ -333,7 +338,7 @@
           <header class="pane-header">
             <h1 id="sidebar-title">Chats</h1>
             <div class="header-spacer"></div>
-            <div id="tor-pill" class="tor-pill connecting" role="status" aria-live="polite">
+            <div id="tor-pill" class="tor-pill connecting" role="status" aria-live="polite" aria-label="Tor status — tap for diagnostics" title="Tor status — tap for diagnostics">
               <span class="pill-icon">
                 <svg class="pill-spinner" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="2.5" stroke-dasharray="50 12" stroke-linecap="round"/></svg>
                 <svg class="pill-check" viewBox="0 0 24 24"><path d="M9 16.2L4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4L9 16.2z" fill="currentColor"/></svg>
@@ -341,12 +346,31 @@
                 <svg class="pill-offline" viewBox="0 0 24 24"><line x1="6" y1="12" x2="18" y2="12" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/></svg>
               </span>
               <span class="pill-label"></span>
+              <!-- Shown INSTEAD of pill-icon/pill-label while the two directions
+                   disagree: outbound circuits are up (we can send) but our
+                   descriptor isn't published yet (nobody can reach us). One word
+                   cannot say that honestly, so the pill splits in two until both
+                   agree, then collapses back to a single "Online". -->
+              <span class="pill-split" hidden>
+                <span class="pill-leg">
+                  <svg class="leg-icon leg-check" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 16.2L4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4L9 16.2z" fill="currentColor"/></svg>
+                  <span>Send</span>
+                </span>
+                <span class="pill-leg">
+                  <svg class="leg-icon leg-spinner" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="2.5" stroke-dasharray="50 12" stroke-linecap="round"/></svg>
+                  <span>Receive</span>
+                </span>
+              </span>
               <span class="pill-bar"><span class="pill-bar-fill"></span></span>
             </div>
-            <span class="header-gap"></span>
+            <span id="header-gap" class="header-gap"></span>
             <button id="search-btn" class="icon-btn header-action" type="button" aria-label="Search chats and contacts"><svg class="icon"><use href="#ic-search"/></svg></button>
+            <!-- Only the desktop build shows this: on a touch build you pull the
+                 list down to refresh, which needs no button. -->
+            <button id="refresh-btn" class="icon-btn header-action" type="button" aria-label="Refresh" hidden><svg class="icon"><use href="#ic-refresh"/></svg></button>
           </header>
           <div id="list-pane">
+            <div id="ptr" class="ptr" aria-hidden="true"><svg class="icon"><use href="#ic-refresh"/></svg></div>
             <div id="tab-chats" class="tab">
               <md-list id="contacts-list"></md-list>
               <div id="no-contacts" class="empty-state" hidden>
@@ -355,9 +379,8 @@
                 <p class="empty-sub body muted">Add someone to start a private end-to-end encrypted chat.</p>
                 <div class="empty-actions">
                   <md-filled-tonal-button id="empty-add-btn" class="empty-cta"><svg slot="icon" class="icon"><use href="#ic-add"/></svg>Add someone</md-filled-tonal-button>
-                  <md-filled-tonal-button id="empty-scan-btn" class="empty-cta"><svg slot="icon" class="icon"><use href="#ic-qr"/></svg>Scan QR</md-filled-tonal-button>
-                  <md-filled-tonal-button id="empty-group-btn" class="empty-cta"><svg slot="icon" class="icon"><use href="#ic-group"/></svg>Create group</md-filled-tonal-button>
-                  <md-text-button id="empty-paste-btn">Paste account</md-text-button>
+                  <md-text-button id="empty-scan-btn"><svg slot="icon" class="icon"><use href="#ic-qr"/></svg>Scan QR</md-text-button>
+                  <md-text-button id="empty-group-btn"><svg slot="icon" class="icon"><use href="#ic-group"/></svg>Create group</md-text-button>
                 </div>
               </div>
             </div>
@@ -378,45 +401,54 @@
                 <p class="empty-sub body muted">When someone wants to connect, or asks you to relay for them, it shows up here.</p>
                 <div class="empty-actions">
                   <md-filled-tonal-button id="requests-add-btn" class="empty-cta"><svg slot="icon" class="icon"><use href="#ic-add"/></svg>Add someone</md-filled-tonal-button>
-                  <md-outlined-button id="requests-share-btn"><svg slot="icon" class="icon"><use href="#ic-share"/></svg>Share my code</md-outlined-button>
+                  <md-filled-tonal-button id="requests-share-btn"><svg slot="icon" class="icon"><use href="#ic-share"/></svg>Share my code</md-filled-tonal-button>
                 </div>
               </div>
             </div>
             <div id="tab-you" class="tab" hidden>
               <div class="you-tabs" role="tablist" aria-label="Settings sections">
-                <button class="you-tab active" type="button" data-pane="profile" role="tab">Profile</button>
-                <button class="you-tab" type="button" data-pane="prefs" role="tab">Preferences</button>
-                <button class="you-tab" type="button" data-pane="devices" role="tab">Devices</button>
-                <button class="you-tab" type="button" data-pane="security" role="tab">Security</button>
+                <button class="you-tab active" type="button" data-pane="profile" role="tab" aria-selected="true">Profile</button>
+                <button class="you-tab" type="button" data-pane="prefs" role="tab" aria-selected="false">Preferences</button>
+                <button class="you-tab" type="button" data-pane="devices" role="tab" aria-selected="false">Devices</button>
+                <button class="you-tab" type="button" data-pane="security" role="tab" aria-selected="false">Security</button>
               </div>
               <div class="you-section card-surface pane-on" data-you-pane="profile">
-                <div class="profile-avatar-row">
+                <div class="you-row">
                   <button type="button" id="avatar-btn" class="avatar-picker" aria-label="Change profile picture">
                     <span id="my-avatar" class="avatar-wrap avatar-lg"></span>
-                    <span class="avatar-edit-badge"><svg class="icon"><use href="#ic-edit"/></svg></span>
+                    <!-- renderMyAvatar swaps this to a magnifier once a picture is
+                         set, because the button then OPENS the picture rather than
+                         the file picker; a pencil there would promise the wrong thing. -->
+                    <span class="avatar-edit-badge"><svg class="icon"><use id="avatar-badge-icon" href="#ic-edit"/></svg></span>
                   </button>
-                  <div class="stack-tight">
+                  <div class="you-row-text">
                     <span class="label muted">Profile picture</span>
-                    <span class="body muted avatar-hint">Shown to people when they add you</span>
-                    <md-text-button id="avatar-remove-btn" hidden>Remove</md-text-button>
+                    <div class="body muted">Shown to people when they add you</div>
                   </div>
                 </div>
                 <p id="avatar-error" class="error body" role="alert" hidden></p>
                 <input type="file" id="avatar-input" accept="image/jpeg,image/png,image/webp,image/gif" hidden>
-                <div class="row-between">
-                  <div><span class="label muted">Display name</span>
-                    <div id="display-name-text" class="title">—</div>
+                <div class="you-row you-row-inset">
+                  <div class="you-row-text">
+                    <span class="label muted">Display name</span>
+                    <div id="display-name-text" class="body muted">—</div>
                   </div>
                   <button id="edit-name-btn" class="icon-btn" aria-label="Edit name"><svg class="icon"><use href="#ic-edit"/></svg></button>
                 </div>
               </div>
               <div class="you-section card-surface hero-card pane-on" data-you-pane="profile">
-                <span class="label muted">Your account (also your onion address)</span>
+                <span class="label muted">Your friend code</span>
                 <p id="account" class="account"></p>
                 <div class="btn-row account-actions">
                   <md-filled-button id="copy-account" class="action-btn"><svg slot="icon" class="icon"><use href="#ic-copy"/></svg>Copy</md-filled-button>
                   <md-filled-tonal-button id="show-qr" class="action-btn"><svg slot="icon" class="icon"><use href="#ic-qr"/></svg>QR code</md-filled-tonal-button>
-                  <span id="copy-feedback" class="label muted" hidden>Copied ✓</span>
+                  <md-text-button id="onetime-refresh"><svg slot="icon" class="icon"><use href="#ic-refresh"/></svg>New code</md-text-button>
+                </div>
+                <div class="row-between onetime-toggle-row">
+                  <div><span class="label muted">Auto-refresh after use</span>
+                    <div class="body muted" id="onetime-state">Off — this code can be shared and reused</div>
+                  </div>
+                  <md-switch id="onetime-switch"></md-switch>
                 </div>
                 <p id="tor-status" class="tor label muted"></p>
               </div>
@@ -481,9 +513,7 @@
               </div>
               </div>
               <div class="you-group" data-you-pane="security">
-                <div class="section-head" style="display:flex;align-items:center;gap:0.5rem">
-                  <svg class="icon" style="width:20px;height:20px;opacity:0.6"><use href="#ic-lock"/></svg> Security
-                </div>
+                <div class="section-head">Security</div>
               <div class="you-section card-surface">
                 <div class="row-between">
                   <div><span class="label muted">PIN unlock</span>
@@ -498,17 +528,17 @@
                   <div><span class="label muted">Recovery phrase</span>
                     <div class="body muted">Your 24 words — the only way to restore this account</div>
                   </div>
-                  <button id="view-phrase-btn" class="icon-btn" aria-label="View recovery phrase"><svg class="icon"><use href="#ic-lock"/></svg></button>
+                  <button id="view-phrase-btn" class="icon-btn" aria-label="View recovery phrase"><svg class="icon"><use href="#ic-visibility"/></svg></button>
                 </div>
               </div>
               <div id="view-phrase-modal" class="modal-backdrop" hidden>
-                <div class="modal-card stack" style="max-width:420px">
+                <div class="modal-card narrow stack" role="dialog" aria-modal="true" aria-labelledby="view-phrase-title">
                   <!-- Step 1: confirm the password. -->
-                  <div id="view-phrase-pw-step" class="stack" style="gap:1rem">
-                    <h3 class="title" style="margin:0">View recovery phrase</h3>
+                  <div id="view-phrase-pw-step" class="stack">
+                    <h3 id="view-phrase-title" class="modal-title">View recovery phrase</h3>
                     <p class="body muted">Enter your password to see your 24-word recovery phrase. Make sure no one is looking over your shoulder.</p>
-                    <form id="view-phrase-form" autocomplete="off" class="stack" style="gap:0.75rem">
-                      <md-outlined-text-field id="view-phrase-password" label="Your password" type="password" autocomplete="current-password" style="width:100%"></md-outlined-text-field>
+                    <form id="view-phrase-form" autocomplete="off" class="stack">
+                      <md-outlined-text-field id="view-phrase-password" label="Your password" type="password" autocomplete="current-password" class="full"></md-outlined-text-field>
                       <p id="view-phrase-error" class="label error" hidden></p>
                       <div class="btn-row">
                         <md-text-button id="view-phrase-cancel" type="button">Cancel</md-text-button>
@@ -517,13 +547,13 @@
                     </form>
                   </div>
                   <!-- Step 2: show the words. -->
-                  <div id="view-phrase-show-step" class="stack" hidden style="gap:1rem">
-                    <h3 class="title" style="margin:0">Your recovery phrase</h3>
+                  <div id="view-phrase-show-step" class="stack" hidden>
+                    <h3 class="modal-title">Your recovery phrase</h3>
                     <p class="body muted">Write these down and keep them somewhere safe. Anyone who has them can open your account.</p>
                     <ol id="view-phrase-text" class="phrase-grid" aria-label="Your 24-word recovery phrase, in order"></ol>
                     <div class="phrase-actions">
-                      <md-text-button id="view-phrase-copy">Copy</md-text-button>
-                      <md-text-button id="view-phrase-download">Download</md-text-button>
+                      <md-text-button id="view-phrase-copy"><svg slot="icon" class="icon"><use href="#ic-copy"/></svg>Copy</md-text-button>
+                      <md-text-button id="view-phrase-download"><svg slot="icon" class="icon"><use href="#ic-download"/></svg>Download</md-text-button>
                     </div>
                     <md-filled-button id="view-phrase-done" type="button">Done</md-filled-button>
                   </div>
@@ -545,26 +575,26 @@
                   <button id="edit-duress-btn" class="icon-btn" aria-label="Set duress code"><svg class="icon"><use href="#ic-edit"/></svg></button>
                 </div>
                 <div id="duress-wizard" class="modal-backdrop" hidden>
-                  <div class="modal-card stack" style="max-width:420px">
+                  <div class="modal-card narrow stack" role="dialog" aria-modal="true" aria-labelledby="duress-title">
                     <!-- Step 1: Explanation -->
-                    <div id="duress-step1" class="stack" style="align-items:center; text-align:center; gap:1rem">
-                      <div style="width:64px;height:64px;border-radius:50%;background:var(--md-sys-color-error-container);color:var(--md-sys-color-on-error-container);display:grid;place-items:center">
-                        <svg class="icon" style="width:32px;height:32px"><use href="#ic-lock"/></svg>
+                    <div id="duress-step1" class="stack" style="align-items:center; text-align:center">
+                      <div class="wiz-hero wiz-hero-error">
+                        <svg class="icon" aria-hidden="true"><use href="#ic-lock"/></svg>
                       </div>
-                      <h3 class="title" style="margin:0">Set a Duress Code</h3>
+                      <h3 id="duress-title" class="modal-title">Set a Duress Code</h3>
                       <p class="body muted">A duress code is a <b>fake password</b>. When entered at the unlock screen, it opens a decoy account and silently wipes your real data.</p>
                       <p class="body muted">The person forcing you in will see nothing unusual — it looks like a normal unlock.</p>
-                      <div class="btn-row" style="width:100%">
+                      <div class="btn-row full">
                         <md-text-button id="duress-wiz-cancel" type="button">Cancel</md-text-button>
                         <md-filled-button id="duress-wiz-next1" type="button">I understand — continue</md-filled-button>
                       </div>
                     </div>
                     <!-- Step 2: Password -->
-                    <div id="duress-step2" class="stack" hidden style="gap:1rem">
-                      <h3 class="title" style="margin:0">Confirm your password</h3>
+                    <div id="duress-step2" class="stack" hidden>
+                      <h3 class="modal-title">Confirm your password</h3>
                       <p class="body muted">Enter your real password to continue.</p>
-                      <form id="duress-password-form" autocomplete="off" class="stack" style="gap:0.75rem">
-                        <md-outlined-text-field id="duress-password" label="Your password" type="password" autocomplete="current-password" style="width:100%"></md-outlined-text-field>
+                      <form id="duress-password-form" autocomplete="off" class="stack">
+                        <md-outlined-text-field id="duress-password" label="Your password" type="password" autocomplete="current-password" class="full"></md-outlined-text-field>
                         <p id="duress-error2" class="label error" hidden></p>
                         <div class="btn-row">
                           <md-text-button id="duress-wiz-back1" type="button">Back</md-text-button>
@@ -573,18 +603,18 @@
                       </form>
                     </div>
                     <!-- Step 3: Set code -->
-                    <div id="duress-step3" class="stack" hidden style="gap:1rem">
-                      <h3 class="title" style="margin:0">Choose your duress code</h3>
+                    <div id="duress-step3" class="stack" hidden>
+                      <h3 class="modal-title">Choose your duress code</h3>
                       <p class="body muted">Enter this code at the unlock screen instead of your password and it will <b>wipe this device</b> and open a clean decoy account. You can restore your real account with your recovery phrase on any device.</p>
                       <p class="label muted">It must be different from your password and your PIN.</p>
-                      <form id="duress-form" autocomplete="off" class="stack" style="gap:0.75rem">
-                        <md-outlined-text-field id="duress-code" label="Duress code (6+ characters)" type="password" autocomplete="off" style="width:100%"></md-outlined-text-field>
-                        <md-outlined-text-field id="duress-code2" label="Confirm duress code" type="password" autocomplete="off" style="width:100%"></md-outlined-text-field>
+                      <form id="duress-form" autocomplete="off" class="stack">
+                        <md-outlined-text-field id="duress-code" label="Duress code (6+ characters)" type="password" autocomplete="off" class="full"></md-outlined-text-field>
+                        <md-outlined-text-field id="duress-code2" label="Confirm duress code" type="password" autocomplete="off" class="full"></md-outlined-text-field>
                         <p id="duress-error" class="label error" hidden></p>
-                        <p id="duress-ok" class="label" style="color:var(--md-sys-color-primary)" hidden></p>
+                        <p id="duress-ok" class="label" hidden></p>
                         <div class="btn-row">
                           <md-text-button id="duress-wiz-back2" type="button">Back</md-text-button>
-                          <md-filled-button id="duress-save" type="submit" style="--md-sys-color-primary:var(--md-sys-color-error);--md-sys-color-on-primary:var(--md-sys-color-on-error)">Set duress code</md-filled-button>
+                          <md-filled-button id="duress-save" type="submit" class="danger-fill">Set duress code</md-filled-button>
                         </div>
                       </form>
                       <md-text-button id="duress-clear">Clear any duress code</md-text-button>
@@ -620,7 +650,7 @@
                   <md-text-button id="wipe-off-btn" hidden>Turn off — stop erasing on failed unlocks</md-text-button>
                 </form>
               </div>
-              <md-filled-tonal-button id="lock-btn" class="full"><svg slot="icon" class="icon"><use href="#ic-lock"/></svg>Log out</md-filled-tonal-button>
+              <md-filled-tonal-button id="lock-btn" class="full"><svg slot="icon" class="icon"><use href="#ic-lock"/></svg>Lock Molepipe</md-filled-tonal-button>
               <div class="you-section card-surface">
                 <div class="danger-zone">
                   <div class="danger-zone-header">Danger Zone</div>
@@ -649,6 +679,24 @@
                   </div>
                   <md-switch id="notif-switch"></md-switch>
                 </div>
+              </div>
+              <!-- Global default for copying received photos out of Molepipe's
+                   encrypted store into the phone's own gallery. Off by default:
+                   anything in the gallery is visible to the system photo picker,
+                   other apps and cloud backup. Per-contact overrides live in each
+                   friend's profile pane. Android only — a browser/desktop build
+                   has no gallery to write to. -->
+              <div id="media-save-section" class="you-section card-surface" hidden>
+                <div class="row-between">
+                  <div><span class="label muted">Save photos to my gallery</span>
+                    <div class="body muted" id="media-save-state">Off</div>
+                  </div>
+                  <md-switch id="media-save-switch"></md-switch>
+                </div>
+                <p class="label muted">Photos you receive stay inside Molepipe unless this is on.
+                  Turning it on copies them into your phone's gallery, where other apps,
+                  the photo picker and cloud backup can see them. You can override this
+                  per contact from their profile.</p>
               </div>
               <!-- Only shown by the desktop build; a browser has no login entry
                    to write, so the whole section stays hidden there. -->
@@ -711,7 +759,7 @@
             <div id="detail-titles"><h2 id="detail-title"></h2><span id="detail-presence" class="detail-presence" hidden></span></div>
             <button id="chat-menu-btn" class="icon-btn appbar-end" hidden aria-label="Contact options"><svg class="icon"><use href="#ic-more"/></svg></button>
             <div id="chat-menu" class="menu" hidden>
-              <button data-action="view">View account number</button>
+              <button data-action="cinfo">View contact</button>
               <button data-action="relay" id="chat-menu-relay">Ask to relay for me</button>
               <button data-action="block">Block</button>
               <button data-action="delete" class="danger">Delete conversation</button>
@@ -738,13 +786,15 @@
                   <md-filled-tonal-button id="scan-btn" type="button" hidden><svg slot="icon" class="icon"><use href="#ic-qr"/></svg>Scan QR</md-filled-tonal-button>
                   <md-filled-tonal-button id="paste-account-btn" type="button"><svg slot="icon" class="icon"><use href="#ic-copy"/></svg>Paste</md-filled-tonal-button>
                 </div>
-                <div id="find-help-text" class="body muted add-help">Scan someone's QR, paste their account number, or type it below — then send a friend request.</div>
+                <div id="find-help-text" class="body muted add-help">Scan someone's QR, paste their friend code, or type it below — then send a friend request.</div>
                 <div id="find-preview" class="find-preview card-surface" hidden>
                   <span id="find-preview-avatar" class="avatar-wrap"></span>
                   <span id="find-preview-name" class="body"></span>
                 </div>
-                <md-outlined-text-field id="find-account" label="Account number (…d.onion)" type="text" required></md-outlined-text-field>
+                <md-outlined-text-field id="find-account" label="Friend code" type="text" required></md-outlined-text-field>
                 <md-filled-button id="find-btn" type="submit">Look up</md-filled-button>
+                <md-linear-progress id="find-progress" indeterminate hidden></md-linear-progress>
+                <p id="find-hint" class="label muted" hidden>Looking someone up over Tor can take a minute on a cold start.</p>
                 <p id="find-error" class="error body" role="alert" hidden></p>
                 <div id="find-result" class="find-result card-surface" hidden>
                   <div class="find-identity"><span id="find-avatar" class="avatar-wrap"></span>
@@ -772,10 +822,10 @@
                 <div id="group-admin-controls" hidden>
                   <span class="label muted section-label">Invite a contact</span>
                   <div id="group-invite-contacts"></div>
-                  <md-text-button id="group-invite-btn" class="full">Invite by account number instead</md-text-button>
+                  <md-text-button id="group-invite-btn" class="full">Invite by friend code instead</md-text-button>
                   <form id="group-invite-form" hidden autocomplete="off" class="stack">
                     <p class="label muted">Paste the account number of someone to invite.</p>
-                    <md-outlined-text-field id="group-invite-account" label="Account number" type="text"></md-outlined-text-field>
+                    <md-outlined-text-field id="group-invite-account" label="Friend code" type="text"></md-outlined-text-field>
                     <p id="group-invite-error" class="label error" hidden></p>
                     <div class="btn-row">
                       <md-text-button id="group-invite-cancel" type="button">Cancel</md-text-button>
@@ -796,12 +846,62 @@
               </div>
             </div>
 
+            <!-- Friend profile. A sub-screen of an open 1:1 chat (back returns to
+                 the chat), reached by tapping the contact's name or avatar in the
+                 chat header. Mirrors #group-info's structure so the two detail
+                 sub-screens stay visually consistent. -->
             <div id="contact-info" class="pane" hidden>
               <div class="info-body">
-                <span class="label muted">Account number (also their onion address)</span>
-                <p id="contact-info-account" class="account"></p>
-                <div class="btn-row">
-                  <md-text-button id="contact-info-copy"><svg slot="icon" class="icon"><use href="#ic-copy"/></svg>Copy</md-text-button>
+                <div class="ci-hero">
+                  <button id="ci-avatar-btn" class="ci-avatar-btn" type="button" aria-label="View profile picture full screen"></button>
+                  <div class="ci-name-row">
+                    <div id="ci-name" class="title"></div>
+                    <button id="ci-nickname-btn" class="icon-btn" type="button" aria-label="Set a nickname for this contact"><svg class="icon"><use href="#ic-edit"/></svg></button>
+                  </div>
+                  <!-- Shown only while a nickname is set. A private label that
+                       HID the name its owner published would make them easier to
+                       impersonate, not harder, so the real one stays visible. -->
+                  <div id="ci-realname" class="body muted" hidden></div>
+                  <div id="ci-presence" class="body muted"></div>
+                  <div id="ci-account" class="ci-account label muted"></div>
+                </div>
+
+                <span class="label muted section-label">Search this chat</span>
+                <div class="search-field ci-search">
+                  <svg class="icon search-icon" aria-hidden="true"><use href="#ic-search"/></svg>
+                  <input id="ci-search-input" class="search-input" type="text" inputmode="search" placeholder="Search messages" autocomplete="off" aria-label="Search this conversation">
+                  <button id="ci-search-clear" class="icon-btn" type="button" aria-label="Clear search" hidden><svg class="icon"><use href="#ic-close"/></svg></button>
+                </div>
+                <div id="ci-search-results" class="ci-search-results" role="list"></div>
+
+                <span class="label muted section-label">Media</span>
+                <div id="ci-media-grid" class="ci-media-grid"></div>
+                <p id="ci-media-empty" class="body muted" hidden>No photos in this chat yet.</p>
+
+                <span class="label muted section-label">Notifications</span>
+                <div class="row-between ci-switch-row">
+                  <div><span class="label muted">Mute notifications</span>
+                    <div class="body muted" id="ci-mute-state">Notifications are on</div>
+                  </div>
+                  <md-switch id="ci-mute-switch"></md-switch>
+                </div>
+
+                <span class="label muted section-label">Save photos to this phone</span>
+                <div class="seg-toggle ci-media-toggle">
+                  <button type="button" class="seg" data-media="default">Default</button>
+                  <button type="button" class="seg" data-media="on">Always</button>
+                  <button type="button" class="seg" data-media="off">Never</button>
+                </div>
+                <p id="ci-media-hint" class="label muted"></p>
+
+                <span class="label muted section-label">Groups in common</span>
+                <div id="ci-groups"></div>
+                <p id="ci-groups-empty" class="body muted" hidden>No groups in common.</p>
+
+                <p id="ci-action-error" class="label error" role="alert" hidden></p>
+                <div class="ci-danger">
+                  <md-text-button id="ci-clear-btn" class="full">Clear chat history</md-text-button>
+                  <md-text-button id="ci-block-btn" class="full danger-text">Block contact</md-text-button>
                 </div>
               </div>
             </div>
@@ -867,14 +967,14 @@
       <p id="confirm-message" class="body"></p>
       <div class="btn-row modal-actions">
         <md-filled-tonal-button id="confirm-cancel" type="button">Cancel</md-filled-tonal-button>
-        <md-filled-tonal-button id="confirm-ok" type="button" style="--md-sys-color-secondary-container:var(--md-sys-color-error-container);--md-sys-color-on-secondary-container:var(--md-sys-color-on-error-container)">Delete</md-filled-tonal-button>
+        <md-filled-tonal-button id="confirm-ok" type="button">Delete</md-filled-tonal-button>
       </div>
     </div>
   </div>
 
   <!-- Reusable edit dialog for inline settings (display name, mailbox, etc.) -->
   <div id="edit-dialog" class="modal-backdrop" hidden>
-    <div class="modal-card">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="edit-dialog-title">
       <h2 id="edit-dialog-title" class="modal-title"></h2>
       <div id="edit-dialog-fields" class="stack"></div>
       <div class="btn-row modal-actions">
@@ -896,11 +996,11 @@
        the address big enough to read across a table, plus its QR. Own data only,
        no network surface beyond the existing /api/qr. Tap the backdrop to close. -->
   <div id="account-fs" class="account-fs" hidden>
-    <button id="account-fs-close" class="account-fs-close icon-btn" type="button" aria-label="Close"><svg class="icon"><use href="#ic-back"/></svg></button>
+    <button id="account-fs-close" class="account-fs-close icon-btn" type="button" aria-label="Close"><svg class="icon"><use href="#ic-close"/></svg></button>
     <div class="account-fs-inner">
-      <img id="account-fs-qr" class="account-fs-qr" alt="QR code of your account number" width="260" height="260">
+      <img id="account-fs-qr" class="account-fs-qr" alt="QR code of your friend code" width="260" height="260">
       <p id="account-fs-text" class="account-fs-text"></p>
-      <p class="label muted">Tap anywhere to close</p>
+      <p class="label">Tap the background to close</p>
     </div>
   </div>
 
@@ -910,7 +1010,10 @@
   <div id="search-view" class="search-view" hidden>
     <header class="search-bar">
       <button id="search-close" class="icon-btn" type="button" aria-label="Close search"><svg class="icon"><use href="#ic-back"/></svg></button>
-      <input id="search-input" class="search-input" type="text" inputmode="search" placeholder="Search chats and contacts" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" aria-label="Search chats and contacts">
+      <div class="search-field">
+        <input id="search-input" class="search-input" type="text" inputmode="search" placeholder="Search chats and contacts" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" aria-label="Search chats and contacts">
+        <button id="search-clear" class="icon-btn" type="button" aria-label="Clear search" hidden><svg class="icon"><use href="#ic-close"/></svg></button>
+      </div>
     </header>
     <md-list id="search-results" class="search-results"></md-list>
     <div id="search-empty" class="search-empty" hidden>
@@ -922,9 +1025,43 @@
   <!-- Fullscreen photo viewer (tap a received image). Pinch/double-tap to zoom
        and pan; the top bar carries download and forward. Tapping the dark
        backdrop (only) closes it — controls and the image itself do not. -->
+  <!-- Profile-picture crop editor. Opened after a file is chosen (You screen or
+       the setup wizard); drag to reposition, pinch/wheel/slider to zoom. The
+       circle shows exactly what will be kept — avatars render circular
+       everywhere, so cropping to a square the user cannot see would let them
+       frame a face that then gets clipped. -->
+  <div id="avatar-crop" class="modal-backdrop" hidden>
+    <div class="modal-card avatar-crop-card" role="dialog" aria-modal="true" aria-labelledby="avatar-crop-title">
+      <h2 id="avatar-crop-title" class="modal-title">Position your picture</h2>
+      <div id="avatar-crop-stage" class="avatar-crop-stage">
+        <img id="avatar-crop-img" alt="">
+        <div class="avatar-crop-mask" aria-hidden="true"></div>
+      </div>
+      <label class="avatar-crop-zoom">
+        <svg class="icon" aria-hidden="true"><use href="#ic-image"/></svg>
+        <input id="avatar-crop-zoom" type="range" min="1" max="4" step="0.01" value="1" aria-label="Zoom">
+      </label>
+      <p id="avatar-crop-error" class="label error" role="alert" hidden></p>
+      <div class="btn-row modal-actions">
+        <md-text-button id="avatar-crop-cancel" type="button">Cancel</md-text-button>
+        <md-filled-button id="avatar-crop-save" type="button">Save</md-filled-button>
+      </div>
+    </div>
+  </div>
+
   <div id="image-viewer" class="image-viewer" hidden>
     <div class="image-viewer-bar">
-      <button id="image-viewer-close" class="iv-btn" type="button" aria-label="Close"><svg class="icon"><use href="#ic-back"/></svg></button>
+      <div class="iv-start">
+        <button id="image-viewer-close" class="iv-btn" type="button" aria-label="Close"><svg class="icon"><use href="#ic-close"/></svg></button>
+        <span id="image-viewer-state" class="iv-state" hidden>Not sent</span>
+      </div>
+      <!-- Shown instead of the photo actions when the viewer holds YOUR profile
+           picture (openImageViewer kind:"avatar"): editing and removing it are
+           the only things that make sense there. -->
+      <div id="image-viewer-avatar-actions" class="iv-actions" hidden>
+        <button id="image-viewer-avatar-edit" class="iv-btn" type="button" aria-label="Choose a new profile picture"><svg class="icon"><use href="#ic-edit"/></svg></button>
+        <button id="image-viewer-avatar-remove" class="iv-btn" type="button" aria-label="Remove profile picture"><svg class="icon"><use href="#ic-delete"/></svg></button>
+      </div>
       <div id="image-viewer-actions" class="iv-actions">
         <button id="image-viewer-download" class="iv-btn" type="button" aria-label="Download to gallery"><svg class="icon"><use href="#ic-download"/></svg></button>
         <button id="image-viewer-share" class="iv-btn" type="button" aria-label="Share"><svg class="icon"><use href="#ic-share"/></svg></button>
@@ -951,13 +1088,18 @@
   <!-- Emoji reaction picker, opened from the message menu's React item. -->
   <div id="react-bar" class="react-bar" hidden role="menu" aria-label="Pick a reaction"></div>
 
-  <!-- Forward picker: choose a contact or group to forward a message into. -->
+  <!-- Chat picker: choose one or more contacts/groups to send into. Serves both
+       forwarding a message and sending a photo shared in from another app. -->
   <div id="forward-modal" class="modal-backdrop" hidden>
     <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="forward-title">
       <h2 id="forward-title" class="modal-title">Forward to…</h2>
       <div id="forward-list" class="forward-list" role="listbox" aria-label="Choose a chat"></div>
       <div class="btn-row modal-actions">
         <md-text-button id="forward-cancel" type="button">Cancel</md-text-button>
+        <!-- Tapping a chat ticks it; this sends to every one that's ticked. The
+             label carries the count ("Send to 3") and it stays disabled until
+             at least one chat is chosen. -->
+        <md-filled-button id="forward-send" type="button" disabled>Send</md-filled-button>
       </div>
     </div>
   </div>
@@ -974,7 +1116,6 @@
       <pre id="tor-log-content" class="tor-log-content"></pre>
       <div class="diag-footer">
         <md-filled-button id="diag-copy" class="full"><svg slot="icon" class="icon"><use href="#ic-copy"/></svg>Copy all</md-filled-button>
-        <span id="diag-copy-feedback" class="label muted" hidden>Copied ✓</span>
         <span class="label muted diag-note">Stays on this device. Copy and share it yourself if you want help.</span>
       </div>
     </div>

@@ -252,19 +252,28 @@ func OpenMailEnvelope(id *identity.Identity, m MailEnvelope) (sender, msgID, tex
 	if c.Kind == MailKindImage {
 		return "", "", "", time.Time{}, fmt.Errorf("image payload not accepted on the text path")
 	}
+	if c.Kind == MailKindRotation {
+		return "", "", "", time.Time{}, fmt.Errorf("rotation payload not accepted on the text path")
+	}
 	return c.Sender, c.MsgID, c.Text, c.SentAt, nil
 }
 
-// MailContent is a decrypted mail envelope's content, interpreting text vs image.
+// MailContent is a decrypted mail envelope's content, interpreting text vs image
+// vs address-rotation.
 type MailContent struct {
 	Sender string
 	MsgID  string
-	Kind   string // "" for text, MailKindImage for an image
+	Kind   string // "" for text, MailKindImage for an image, MailKindRotation for a rotation
 	Text   string
 	Mime   string
 	Data   []byte
 	Reply  Reply // reply-with-context; zero for a non-reply (text only)
-	SentAt time.Time
+	// Rotation is set only when Kind == MailKindRotation. The sender's identity
+	// must be taken from the envelope's SenderDHPub (matched to a cached contact),
+	// NEVER from Sender — a rotation announces an alias the receiver doesn't yet
+	// trust. See AddressRotation.
+	Rotation AddressRotation
+	SentAt   time.Time
 }
 
 // OpenMailContent verifies, decrypts and interprets a picked-up mail envelope,
@@ -284,6 +293,12 @@ func OpenMailContent(id *identity.Identity, m MailEnvelope) (MailContent, error)
 			return MailContent{}, fmt.Errorf("unsupported image type")
 		}
 		return MailContent{Sender: m.Sender, MsgID: p.ID, Kind: MailKindImage, Mime: p.Mime, Data: p.Data, SentAt: time.Unix(m.SentAt, 0)}, nil
+	}
+	// Address rotation: identity comes from m.SenderDHPub (matched to a cached
+	// contact by the caller), NOT m.Sender. The onion shape is validated in the
+	// decoder; the monotonic-index and DHPub-match checks are the caller's.
+	if r, ok := DecodeRotationPayload(pt); ok {
+		return MailContent{Sender: m.Sender, Kind: MailKindRotation, Rotation: r, SentAt: time.Unix(m.SentAt, 0)}, nil
 	}
 	// Text (or a legacy bare-text plaintext). Bound size as before.
 	if len(pt) > maxPlaintext {

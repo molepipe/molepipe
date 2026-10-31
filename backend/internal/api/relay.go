@@ -16,7 +16,6 @@ import (
 )
 
 const (
-	relayStartDelay  = 25 * time.Second
 	relayInterval    = 45 * time.Second // how often we retry forwarding held blobs
 	relayOpTimeout   = 60 * time.Second
 	relayWorkers     = 4 // cap concurrent outbound dials while forwarding
@@ -161,17 +160,9 @@ func relayReject(w http.ResponseWriter) {
 // --- relay forward loop (we are the relay-holder pushing to recipients) ---
 
 func (s *Server) relayForwardLoop(ctx context.Context) {
-	t := time.NewTimer(relayStartDelay)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			s.relayForwardTick(ctx)
-			t.Reset(relayInterval)
-		}
-	}
+	s.runLoop(ctx, relayInterval, func() {
+		s.relayForwardTick(ctx)
+	})
 }
 
 func (s *Server) relayForwardTick(ctx context.Context) {
@@ -436,7 +427,7 @@ func (s *Server) handleRelayMessage(w http.ResponseWriter, r *http.Request, id *
 	}
 	// Handed to the relay: the message is on its way, so it leaves the queue and
 	// stops showing as failed. It is already in the conversation.
-	s.markDelivered(item.ID)
+	s.markDelivered(item.ID, "") // via a relay: proves nothing about the recipient
 	writeJSON(w, http.StatusOK, map[string]string{"status": "sent", "via": "relay"})
 }
 

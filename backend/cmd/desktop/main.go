@@ -39,6 +39,7 @@ import (
 	"github.com/molepipe/molepipe/backend/internal/datalock"
 	"github.com/molepipe/molepipe/backend/internal/desktop"
 	"github.com/molepipe/molepipe/backend/internal/identity"
+	"github.com/molepipe/molepipe/backend/internal/runlog"
 	"github.com/molepipe/molepipe/backend/internal/tor"
 	"github.com/molepipe/molepipe/backend/internal/torsidecar"
 )
@@ -102,8 +103,8 @@ func main() {
 	}
 	defer unlock()
 
-	if logFile, err := os.OpenFile(filepath.Join(store.Dir, api.LogFileName),
-		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600); err == nil {
+	if logFile, err := runlog.Open(filepath.Join(store.Dir, api.LogFileName),
+		runlog.MaxBytes); err == nil {
 		log.SetOutput(io.MultiWriter(os.Stderr, logFile))
 		defer logFile.Close()
 	} else {

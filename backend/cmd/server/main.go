@@ -20,6 +20,7 @@ import (
 	"github.com/molepipe/molepipe/backend/internal/api"
 	"github.com/molepipe/molepipe/backend/internal/datalock"
 	"github.com/molepipe/molepipe/backend/internal/identity"
+	"github.com/molepipe/molepipe/backend/internal/runlog"
 	"github.com/molepipe/molepipe/backend/internal/tor"
 	"github.com/molepipe/molepipe/backend/internal/torsidecar"
 )
@@ -55,8 +56,8 @@ func main() {
 	// — the ones that found four real bugs in this project — is invisible to
 	// whoever is running it. The duress and account-removal wipes empty this
 	// file, because it names the accounts you talked to.
-	if logFile, err := os.OpenFile(filepath.Join(store.Dir, api.LogFileName),
-		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600); err == nil {
+	if logFile, err := runlog.Open(filepath.Join(store.Dir, api.LogFileName),
+		runlog.MaxBytes); err == nil {
 		log.SetOutput(io.MultiWriter(os.Stderr, logFile))
 		defer logFile.Close()
 	} else {

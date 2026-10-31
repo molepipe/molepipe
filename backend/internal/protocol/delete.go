@@ -95,6 +95,15 @@ type payload struct {
 	ReplyID      string `json:"reply_id,omitempty"`
 	ReplyPreview string `json:"reply_preview,omitempty"`
 	ReplyAuthor  string `json:"reply_author,omitempty"`
+	// Address-rotation fields (Kind == MailKindRotation). NewOnion is the sender's
+	// new externally-visible alias onion; AliasIndex is monotonic (rollback-replay
+	// guard); ValidFrom is reserved for future clock-skew tolerance. All omitempty
+	// so a text/image plaintext still decodes byte-for-byte unchanged. The rotation
+	// carries no identity of its own — the sealing channel authenticates the sender
+	// (see AddressRotation).
+	NewOnion   string `json:"new_onion,omitempty"`
+	AliasIndex uint32 `json:"alias_index,omitempty"`
+	ValidFrom  int64  `json:"valid_from,omitempty"`
 }
 
 // MailKindImage is the payload.Kind value for an image carried through a mailbox.

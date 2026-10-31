@@ -20,9 +20,8 @@ import (
 )
 
 const (
-	syncStartDelay = 20 * time.Second
-	syncInterval   = 60 * time.Second
-	syncOpTimeout  = 90 * time.Second
+	syncInterval  = 60 * time.Second
+	syncOpTimeout = 90 * time.Second
 )
 
 // --- control API: pairing ---
@@ -96,7 +95,9 @@ func (s *Server) handlePairLink(w http.ResponseWriter, r *http.Request, id *iden
 	}
 	// This device is now a secondary, so startOnion runs as a dial-out client and
 	// ignores the key; derive it anyway (cheap, never fails for a live identity)
-	// so the call site stays uniform with the primary paths.
+	// so the call site stays uniform with the primary paths. A secondary never
+	// publishes the onion, so it deliberately does NOT republish rotation aliases
+	// either — only the primary hosts them (see handleMakePrimary / finishUnlock).
 	if onionKey, err := onionKeyFor(id); err != nil {
 		log.Printf("derive onion key after link: %v", err)
 	} else if err := s.startOnion(onionKey); err != nil {
@@ -164,6 +165,8 @@ func (s *Server) handlePairLinkSetup(w http.ResponseWriter, r *http.Request) {
 	s.ready.Add(1)
 	go func() {
 		defer s.ready.Done()
+		// Secondary (a linking device never publishes the onion), so no rotation
+		// aliases are republished here — only the primary hosts them.
 		s.startOnion(onionKey)
 	}()
 	// Wait briefly for Tor to become dialable, then link.
@@ -287,6 +290,19 @@ func (s *Server) handleMakePrimary(w http.ResponseWriter, r *http.Request, id *i
 		log.Printf("derive onion key after promote: %v", err)
 	} else if err := s.startOnion(onionKey); err != nil {
 		log.Printf("start onion after promote: %v", err)
+	} else {
+		// This device now publishes as primary, so it must also republish the live
+		// rotation-alias set — an un-updated contact mid-grace still dials an
+		// alias-of-us. Derive synchronously while the identity is live (reads the
+		// mnemonic), like finishUnlock; startOnion above already blocked on Tor, so
+		// publishing inline here keeps the same shape.
+		s.sessMu.Lock()
+		prepared, aliasErr := s.prepareLiveAliasesLocked(id)
+		s.sessMu.Unlock()
+		if aliasErr != nil {
+			log.Printf("rotation: derive live aliases after promote: %v", aliasErr)
+		}
+		s.publishPreparedAliases(prepared)
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "primary"})
 }
@@ -308,27 +324,19 @@ func (s *Server) awaitDialable(timeout time.Duration) error {
 // syncLoop periodically syncs from the primary. It only acts while this device is
 // a secondary — the primary is the passive hub that secondaries dial.
 func (s *Server) syncLoop(ctx context.Context, id *identity.Identity) {
-	t := time.NewTimer(syncStartDelay)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			if d := s.currentDevice(); d != nil && !d.IsPrimary() {
-				if err := s.syncOnce(ctx, id); err != nil {
-					log.Printf("sync: %v", err)
-				}
-				// After the metadata merge, backfill any image blobs this device
-				// is missing (and push ones the primary asked for). Separate round
-				// trip: image bytes are far too large to ride the state exchange.
-				if err := s.attachmentSyncOnce(ctx, id); err != nil {
-					log.Printf("attachment sync: %v", err)
-				}
+	s.runLoop(ctx, syncInterval, func() {
+		if d := s.currentDevice(); d != nil && !d.IsPrimary() {
+			if err := s.syncOnce(ctx, id); err != nil {
+				log.Printf("sync: %v", err)
 			}
-			t.Reset(syncInterval)
+			// After the metadata merge, backfill any image blobs this device
+			// is missing (and push ones the primary asked for). Separate round
+			// trip: image bytes are far too large to ride the state exchange.
+			if err := s.attachmentSyncOnce(ctx, id); err != nil {
+				log.Printf("attachment sync: %v", err)
+			}
 		}
-	}
+	})
 }
 
 // syncOnce does one sync round trip with the primary and adopts the merged state.

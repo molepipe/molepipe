@@ -54,6 +54,28 @@ int torhost_start_service(torhost_handle h, const char *nickname,
                           const uint8_t *key_ptr, size_t key_len,
                           uint16_t local_port, char **out_onion);
 
+/* Launch an ADDITIONAL onion service (a rotation alias) alongside the primary,
+ * on the existing bootstrapped TorClient. Unlike torhost_start_service this does
+ * NOT touch the primary service slot. `nickname` MUST be distinct from the
+ * primary's and every other live alias (arti keys HS state by nickname).
+ * Returns a non-zero id on success (writing the .onion to *out_onion), or 0 on
+ * failure. Stop it with torhost_stop_service_by_id. */
+uint64_t torhost_start_extra_service(torhost_handle h, const char *nickname,
+                                     const uint8_t *key_ptr, size_t key_len,
+                                     uint16_t local_port, char **out_onion);
+
+/* Stop and drop a single rotation alias by the id returned from
+ * torhost_start_extra_service. Aborts its forwarder and unpublishes it; does not
+ * scrub the shared keystore. No-op if the id is unknown. */
+void torhost_stop_service_by_id(torhost_handle h, uint64_t id);
+
+/* The onion service's own state, as an opaque code (0 unknown / no service,
+ * 1 shutdown, 2 bootstrapping, 3 degraded-unreachable, 4 running,
+ * 5 degraded-reachable, 6 recovering, 7 broken). Distinguishes "mid-publish
+ * and progressing" from "given up", which torhost_ready's single bit cannot;
+ * the publish watchdog needs that to avoid restarting a working publish. */
+int torhost_service_state(torhost_handle h);
+
 /* Bootstrap fraction (0.0 just started .. 1.0 fully bootstrapped). */
 float torhost_bootstrap_frac(torhost_handle h);
 
@@ -68,6 +90,17 @@ void torhost_free_string(char *s);
  * startup so the first torhost_start does not pay the init cost. Safe to
  * call multiple times. */
 void torhost_prewarm(void);
+
+/* Set the arti tracing filter, e.g. "tor_hsservice=debug" (or several, comma
+ * separated); "" or NULL turns it off, which is the default. arti reports its
+ * internals through `tracing`, not `log`, so without a filter none of them
+ * reach the log ring — which is why an onion-service publish stall shows up as
+ * a bare "intro point failure" with no cause. Leave it off outside a
+ * diagnosis: arti at DEBUG floods the 400-line ring and evicts the status
+ * transitions. Normally set from <data_dir>/trace_filter at start instead, so
+ * the capture covers the publish attempt right after unlock; this entry point
+ * is for changing it on an already-running device. */
+void torhost_set_trace_filter(const char *spec);
 
 /* Toggle dormant mode. When dormant is non-zero, proactive background tasks
  * (preemptive circuit building, directory fetches) are suspended, conserving

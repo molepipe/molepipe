@@ -19,12 +19,16 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/molepipe/molepipe/backend/internal/api"
 	"github.com/molepipe/molepipe/backend/internal/datalock"
 	"github.com/molepipe/molepipe/backend/internal/identity"
+	"github.com/molepipe/molepipe/backend/internal/runlog"
 )
 
 // A single running instance per process. Android recreates activities and may
@@ -35,12 +39,7 @@ var (
 	mu      sync.Mutex
 	srv     *api.Server
 	release func() error // datalock release; nil when not held
-	logFile *os.File     // in-dataDir log; nil when not open
-
-	// torReadyOnce tracks whether Tor has fully bootstrapped at least once
-	// this session. Dormant mode is deferred until this is true — going
-	// dormant during bootstrap suspends proactive tasks and slows startup.
-	torReadyOnce bool
+	logFile *runlog.File // in-dataDir log, size-bounded; nil when not open
 )
 
 // MessageListener receives callbacks for newly delivered inbound messages,
@@ -51,6 +50,7 @@ var (
 type MessageListener interface {
 	OnMessage(fromName, preview string, atMillis int64, avatarBytes []byte)
 	OnFriendRequest(fromName string)
+	OnFriendAccept(fromName string)
 	OnGroupInvite(inviterName, groupName string)
 }
 
@@ -107,11 +107,20 @@ func Start(dataDir string) (string, error) {
 	// Go runtime sends stderr to logcat, which survives an account wipe and
 	// which the duress / account-removal wipe cannot reach — and the log names
 	// the accounts you talked to. Writing only to the in-dataDir file (which the
-	// wipe truncates, see api.LogFileName) keeps a wiped directory
-	// indistinguishable from a fresh install, the same guarantee desktop has.
-	if lf, err := os.OpenFile(filepath.Join(dataDir, api.LogFileName),
-		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600); err == nil {
-		log.SetOutput(lf)
+	// wipe empties, and whose rotated generation the wipe removes — see
+	// api.LogFileName and runlog) keeps a wiped directory indistinguishable from
+	// a fresh install, the same guarantee desktop has.
+	if lf, err := runlog.Open(filepath.Join(dataDir, api.LogFileName),
+		runlog.MaxBytes); err == nil {
+		// gomobile's mobileinit zeroes the log flags because logcat stamps its
+		// own timestamps; our file output inherits that and lands timestampless,
+		// which makes the log nearly useless for working out the order and gap
+		// between two events. localStamp puts the date and time back, in the
+		// device's own zone rather than the UTC the Go runtime reports here —
+		// see SetTimeZone. Flags stay at zero because localStamp writes the
+		// prefix itself.
+		log.SetOutput(localStamp{w: lf})
+		log.SetFlags(0)
 		logFile = lf
 	} else {
 		log.Printf("could not open the log file (continuing without one): %v", err)
@@ -166,17 +175,46 @@ func Start(dataDir string) (string, error) {
 			l.OnFriendRequest(fromName)
 		}
 	})
+	s.SetFriendAcceptHook(func(fromName string) {
+		if l := currentListener(); l != nil {
+			l.OnFriendAccept(fromName)
+		}
+	})
 	s.SetGroupInviteHook(func(inviterName, groupName string) {
 		if l := currentListener(); l != nil {
 			l.OnGroupInvite(inviterName, groupName)
 		}
 	})
-	url, err := s.Start("127.0.0.1:0")
+	// Ask for the SAME loopback port we used last time.
+	//
+	// The WebView's localStorage is keyed by origin, and the origin includes the
+	// port. With an OS-assigned port every new backend process gets a brand-new,
+	// empty localStorage and strands the previous one on disk — so the theme,
+	// accent, PIN-shuffle and notification preferences (and a half-finished
+	// setup wizard's resume point) silently revert to defaults every time the
+	// process restarts: a reinstall, a reboot, an OS kill, or Stop-then-reopen.
+	// The abandoned stores pile up too, one per restart.
+	//
+	// Pinning the port costs nothing in security: 127.0.0.1 is shared across
+	// apps on Android, so what keeps another app off /api is the capability
+	// token in the bootstrap URL, never the port being hard to guess (see
+	// URLWithToken below). A port is trivially discoverable either way.
+	addr := "127.0.0.1:0"
+	if p := readPortHint(dataDir); p != "" {
+		addr = "127.0.0.1:" + p
+	}
+	url, err := s.Start(addr)
+	if err != nil && addr != "127.0.0.1:0" {
+		// Something else grabbed it while we were away. Take any port — the
+		// settings reset this once, which beats refusing to start.
+		url, err = s.Start("127.0.0.1:0")
+	}
 	if err != nil {
 		_ = rel()
 		closeLog()
 		return "", err
 	}
+	writePortHint(dataDir, s.Port())
 
 	srv = s
 	release = rel
@@ -218,18 +256,18 @@ func IsRunning() bool {
 	return srv != nil
 }
 
-// TorServing reports whether the onion service is unlocked and reachable. The
-// Android foreground service polls this to hold a CPU wakelock only while Tor is
-// actively hosting (see BackendService), so the lock tracks the thing that needs
-// the CPU instead of the whole service lifetime.
+// TorServing reports whether the onion service is unlocked and reachable, i.e.
+// actively hosting. Latched across Arti's descriptor-reupload dips; see
+// api.Server.TorServing.
+//
+// Exported for the shells, though none calls it today. The CPU wakelock this
+// was written for is held for BackendService's whole lifetime instead
+// (BackendService.kt), so nothing polls this from Kotlin. Its in-process use is
+// SetDormant's gate below.
 func TorServing() bool {
 	mu.Lock()
 	defer mu.Unlock()
-	serving := srv != nil && srv.TorServing()
-	if serving {
-		torReadyOnce = true
-	}
-	return serving
+	return srv != nil && srv.TorServing()
 }
 
 // SetDormant toggles arti-client's dormant mode on the underlying Tor host.
@@ -239,14 +277,37 @@ func TorServing() bool {
 // foreground and background. No-op if the backend is not running, the host
 // does not support dormant mode, or Tor has not finished bootstrapping yet
 // (going dormant during bootstrap would slow startup).
+//
+// That last gate used to read a package-level torReadyOnce flag whose ONLY
+// writer was TorServing() above — which no shell has ever called. The flag was
+// therefore always false and this function was a permanent no-op: dormant mode
+// never engaged on Android at all, despite MainActivity calling it on every
+// foreground/background transition. It now asks the server, via a gate that is
+// latched (so a descriptor-reupload dip cannot make a backgrounding silently
+// fail to go dormant) and that ignores peer traffic (so a peer reaching us off
+// a previous session's descriptor cannot let us go dormant while this session's
+// publish is still retrying). See api.Server.DormantAllowed.
 func SetDormant(dormant bool) {
 	mu.Lock()
 	defer mu.Unlock()
-	if srv == nil || !torReadyOnce {
+	if srv == nil || !srv.DormantAllowed() {
 		return
 	}
 	if h, ok := srv.OnionHost().(interface{ SetDormant(bool) }); ok {
 		h.SetDormant(dormant)
+	}
+}
+
+// SetTraceFilter configures Arti's internal tracing filter on the underlying
+// Tor host (e.g. "tor_hsservice=debug,tor_circmgr=debug"). "" or "off" disables it.
+func SetTraceFilter(spec string) {
+	mu.Lock()
+	defer mu.Unlock()
+	if srv == nil {
+		return
+	}
+	if h, ok := srv.OnionHost().(interface{ SetTraceFilter(string) }); ok {
+		h.SetTraceFilter(spec)
 	}
 }
 
@@ -269,7 +330,6 @@ func Stop(timeoutMillis int) error {
 
 	err := srv.Shutdown(ctx)
 	srv = nil
-	torReadyOnce = false
 	if release != nil {
 		if relErr := release(); err == nil {
 			err = relErr
@@ -281,6 +341,64 @@ func Stop(timeoutMillis int) error {
 }
 
 // closeLog detaches the log from the file and closes it. Caller holds mu.
+// logLoc is the zone the run log is stamped in, set by SetTimeZone. nil means
+// we were never told, and lines fall back to UTC.
+var logLoc atomic.Pointer[time.Location]
+
+// SetTimeZone tells the backend which zone to stamp its run log in. The shell
+// has to supply this: on Android the Go runtime reports time.Local as UTC
+// unconditionally — zoneinfo_android.go's initLocal hard-codes it and the TODO
+// to read persist.sys.timezone is still open — so a log stamped from
+// time.Local reads hours off the device clock, which sends you looking for an
+// event in the wrong window. id is an IANA name (Kotlin:
+// TimeZone.getDefault().id, Swift: TimeZone.current.identifier);
+// offsetSeconds is that zone's current offset from UTC, used only when the
+// zone can't be loaded from the device's tzdata. Idempotent, safe to call
+// before or after Start, and takes effect on the next line logged.
+func SetTimeZone(id string, offsetSeconds int) {
+	// LoadLocation gets DST transitions right, and the Go runtime finds the
+	// tzdata it needs at /system/usr/share/zoneinfo/tzdata. It can still miss:
+	// Android 10 moved the maintained copy into an APEX module the runtime
+	// doesn't look in, so a device without the legacy copy falls back to a
+	// fixed offset — correct now, and stale only if the log outlives a DST
+	// transition without the app restarting.
+	if loc, err := time.LoadLocation(id); err == nil {
+		logLoc.Store(loc)
+		return
+	}
+	name := id
+	if name == "" {
+		name = "local"
+	}
+	logLoc.Store(time.FixedZone(name, offsetSeconds))
+}
+
+// localStamp prefixes every log line with the local date, time and UTC offset.
+// It stamps rather than reassigning time.Local because the rest of the backend
+// reads that concurrently; this writer is only ever installed before the
+// server starts.
+type localStamp struct{ w io.Writer }
+
+func (s localStamp) Write(p []byte) (int, error) {
+	loc := logLoc.Load()
+	if loc == nil {
+		loc = time.UTC
+	}
+	// One Write for the whole line: log.Logger serialises its own output, so a
+	// separate prefix write would be safe too, but a single buffer keeps the
+	// file readable if anything else ever writes to it. The offset is included
+	// so a log pulled onto a machine in another zone still reads unambiguously.
+	buf := time.Now().In(loc).AppendFormat(make([]byte, 0, len(p)+32), "2006/01/02 15:04:05 -0700 ")
+	prefix := len(buf)
+	buf = append(buf, p...)
+	n, err := s.w.Write(buf)
+	// io.Writer must not report more than it was handed.
+	if n -= prefix; n < 0 {
+		n = 0
+	}
+	return n, err
+}
+
 func closeLog() {
 	if logFile != nil {
 		log.SetOutput(io.Discard)
@@ -295,3 +413,30 @@ func closeLog() {
 // other platform so the host build and mobile_test.go carry no cgo/Arti
 // dependency. api.Server nil-guards every onion call, so the nil path runs the
 // backend Tor-disabled (parity with `cmd/server -no-tor`).
+
+// portHintFile is where Start remembers the loopback port it bound, so the next
+// process can ask for the same one and the WebView keeps the same origin — and
+// therefore the same localStorage. Advisory only: a missing, unreadable or
+// stale hint just means an OS-assigned port and one round of reset preferences.
+const portHintFile = "port"
+
+func readPortHint(dataDir string) string {
+	b, err := os.ReadFile(filepath.Join(dataDir, portHintFile))
+	if err != nil {
+		return ""
+	}
+	p := strings.TrimSpace(string(b))
+	// Only ever hand a plain port number to net.Listen.
+	n, err := strconv.Atoi(p)
+	if err != nil || n < 1024 || n > 65535 {
+		return ""
+	}
+	return p
+}
+
+func writePortHint(dataDir, port string) {
+	if port == "" {
+		return
+	}
+	_ = os.WriteFile(filepath.Join(dataDir, portHintFile), []byte(port), 0o600)
+}

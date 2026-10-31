@@ -62,6 +62,10 @@ func (s *Server) PostNotice(text string) {
 // credential, for a menu item) or exempt the route from auth (weakening a
 // guard for convenience — the thing Phase 7 must not do), both callers share
 // this method.
+//
+// It is also where an expired session lands (vault.onExpire, installed in New):
+// a timeout must end a session the same way the user ending it does, or the
+// onion stays published and the loops keep running against an empty vault.
 func (s *Server) LockNow() {
 	s.vault.lock()
 	s.lockOnion() // immediate teardown, or a grace-deferred one (see lockOnion)

@@ -86,36 +86,56 @@ extension NotificationHandler: UNUserNotificationCenterDelegate {
     }
 }
 
-// MARK: - MessageListener (gomobile)
+// MARK: - MobileMessageListener (gomobile)
 
-extension NotificationHandler: MessageListener {
+// gomobile reverse-binds the Go `MessageListener` interface (backend/mobile) as
+// the @objc protocol `MobileMessageListener`. Method names lowercase the first
+// letter; the first Go parameter becomes an unlabelled Swift argument; and object
+// params (String/[]byte) arrive as Optionals. If Xcode reports this extension
+// does not conform, open Mobile.xcframework's generated `Mobile.objc.h` and match
+// the exact selector/nullability there (see HANDOFF.md → Troubleshooting).
+extension NotificationHandler: MobileMessageListener {
 
     /// Called by the Go backend for each newly delivered inbound message.
-    func onMessage(fromName: String, preview: String, atMillis: Int64, avatarBytes: Data?) {
+    func onMessage(_ fromName: String?, preview: String?, atMillis: Int64, avatarBytes: Data?) {
         let id = "msg-\(atMillis)"
         postNotification(
-            title: fromName,
-            body: preview,
+            title: fromName ?? "",
+            body: preview ?? "",
             id: id
         )
     }
 
     /// Called by the Go backend for each incoming friend request.
-    func onFriendRequest(fromName: String) {
-        let id = "friend-\(fromName)-\(Date().timeIntervalSince1970)"
+    func onFriendRequest(_ fromName: String?) {
+        let name = fromName ?? ""
+        let id = "friend-\(name)-\(Date().timeIntervalSince1970)"
         postNotification(
             title: "Friend request",
-            body: "\(fromName) wants to connect",
+            body: "\(name) wants to connect",
+            id: id
+        )
+    }
+
+    /// Called by the Go backend when a friend request we sent is accepted.
+    func onFriendAccept(_ fromName: String?) {
+        let name = fromName ?? ""
+        let id = "accept-\(name)-\(Date().timeIntervalSince1970)"
+        postNotification(
+            title: "Friend request accepted",
+            body: "\(name) accepted your friend request",
             id: id
         )
     }
 
     /// Called by the Go backend for each incoming group invite.
-    func onGroupInvite(inviterName: String, groupName: String) {
-        let id = "group-\(inviterName)-\(groupName)-\(Date().timeIntervalSince1970)"
+    func onGroupInvite(_ inviterName: String?, groupName: String?) {
+        let inviter = inviterName ?? ""
+        let group = groupName ?? ""
+        let id = "group-\(inviter)-\(group)-\(Date().timeIntervalSince1970)"
         postNotification(
             title: "Group invite",
-            body: "\(inviterName) invited you to \(groupName)",
+            body: "\(inviter) invited you to \(group)",
             id: id
         )
     }

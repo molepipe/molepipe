@@ -559,8 +559,9 @@ func TestFriendRequestFlow(t *testing.T) {
 		t.Fatal("messaging allowed before acceptance")
 	}
 
-	// A sends a friend request to B.
-	sent := sA.do(t, "POST", "/api/friend-requests/send", `{"account":"`+accB+`"}`, hdr(sA, tokA))
+	// A sends a friend request to B, using B's current friend code (the account
+	// alone is no longer addable).
+	sent := sA.do(t, "POST", "/api/friend-requests/send", `{"account":"`+codeOf(t, sB, tokB)+`"}`, hdr(sA, tokA))
 	if sent.Code != http.StatusOK {
 		t.Fatalf("send request: %d (%s)", sent.Code, sent.Body)
 	}

@@ -187,13 +187,10 @@ func (s *Server) deliverInboundImageLocked(sender, msgID, mime string, data []by
 		Direction: "in", Peer: sender, At: at, ID: msgID,
 		Kind: chatstore.KindImage, AttachID: msgID, Mime: mime, Size: len(data),
 	})
-	if s.onInbound != nil {
-		name := sender
+	if s.onInbound != nil && !s.notifyMutedLocked(sender) {
+		name := s.contactDisplayNameLocked(sender, sender)
 		avatarHash := ""
 		if c, ok := s.contacts[sender]; ok {
-			if c.Name != "" {
-				name = c.Name
-			}
 			avatarHash = c.AvatarHash
 		}
 		go s.onInbound(name, "📷 Photo", at.UnixMilli(), avatarHash)
@@ -251,13 +248,10 @@ func (s *Server) handleP2PAttachment(w http.ResponseWriter, r *http.Request) {
 		Kind: chatstore.KindImage, AttachID: msgID, Mime: mime, Size: len(data),
 	})
 	s.persistLocked()
-	if s.onInbound != nil {
-		name := env.Sender
+	if s.onInbound != nil && !s.notifyMutedLocked(env.Sender) {
+		name := s.contactDisplayNameLocked(env.Sender, env.Sender)
 		avatarHash := ""
 		if cc, ok := s.contacts[env.Sender]; ok {
-			if cc.Name != "" {
-				name = cc.Name
-			}
 			avatarHash = cc.AvatarHash
 		}
 		go s.onInbound(name, "📷 Photo", time.Now().UnixMilli(), avatarHash)

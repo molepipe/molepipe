@@ -162,8 +162,8 @@ func (s *Server) handleListGroupMembers(w http.ResponseWriter, r *http.Request, 
 	for _, m := range g.Members {
 		friend := s.friendStatusLocked(m.Account)
 		name := m.Name
-		if c, ok := s.contacts[m.Account]; ok && c.Name != "" {
-			name = c.Name // prefer the name we've saved for them
+		if c, ok := s.contacts[m.Account]; ok && c.DisplayName() != "" {
+			name = c.DisplayName() // prefer our nickname, then the name we've saved
 		}
 		out = append(out, map[string]any{
 			"account": m.Account, "name": name, "role": m.Role, "can_invite": m.CanInvite,
@@ -217,6 +217,36 @@ func (s *Server) handleMarkGroupRead(w http.ResponseWriter, r *http.Request, _ *
 // handleListGroups returns the groups the caller currently belongs to. Groups we
 // have left or been removed from are hidden (we may still hold the roster so a
 // stale lower-epoch push can't re-add us, but they are not conversations).
+// handleCommonGroups lists the groups this account and one contact are BOTH in,
+// for the "groups in common" section of the friend profile pane.
+//
+// It is a separate endpoint rather than a field on GET /api/groups because that
+// list is polled every few seconds by the chat list: carrying every group's full
+// roster there would inflate a hot poll to serve a panel that is open rarely.
+// Here the roster never leaves the backend — only the groups that intersect do.
+//
+// Gated the same way handleListGroups is: a group I am not a member of is never
+// considered, so this cannot be used to probe a stranger's group membership.
+func (s *Server) handleCommonGroups(w http.ResponseWriter, r *http.Request, _ *identity.Identity) {
+	acct := s.decodeAccount(w, r)
+	if acct == "" {
+		return
+	}
+	s.sessMu.Lock()
+	out := []map[string]any{}
+	for _, g := range s.groups {
+		if !groupHasMember(g, s.myAccount) || !groupHasMember(g, acct) {
+			continue
+		}
+		out = append(out, map[string]any{
+			"id": g.ID, "name": g.Name, "member_count": len(g.Members),
+		})
+	}
+	s.sessMu.Unlock()
+	sort.Slice(out, func(i, j int) bool { return out[i]["id"].(string) < out[j]["id"].(string) })
+	writeJSON(w, http.StatusOK, map[string]any{"groups": out})
+}
+
 func (s *Server) handleListGroups(w http.ResponseWriter, r *http.Request, _ *identity.Identity) {
 	s.sessMu.Lock()
 	out := []map[string]any{}

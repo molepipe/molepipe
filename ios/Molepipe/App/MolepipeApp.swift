@@ -1,31 +1,16 @@
 import SwiftUI
 
-/// MolepipeApp is the @main entry point. It configures the scene and
-/// provides the root view.
+/// MolepipeApp is the @main entry point. It only hosts the root view — all
+/// backend lifecycle and scene-phase handling lives in MainView, which is the
+/// single owner (see MainView's `.onChange(of: scenePhase)` / `.onAppear`).
+/// Handling scenePhase here as well would double-fire didEnterBackground /
+/// didEnterForeground (and leak a UIBackgroundTaskIdentifier per background).
 @main
 struct MolepipeApp: App {
-
-    @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
         WindowGroup {
             MainView()
-                .onAppear {
-                    // Ensure the backend starts on first launch.
-                    BackendService.shared.start()
-                }
-        }
-        .onChange(of: scenePhase) { phase in
-            switch phase {
-            case .active:
-                BackendService.shared.didEnterForeground()
-            case .background:
-                BackendService.shared.didEnterBackground()
-            case .inactive:
-                break
-            @unknown default:
-                break
-            }
         }
     }
 }

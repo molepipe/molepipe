@@ -23,8 +23,7 @@ import (
 // loop delivers it. The queue survives restarts because it lives in the
 // chatstore, so closing the app mid-send no longer drops the message.
 const (
-	outboxStartDelay = 5 * time.Second
-	outboxInterval   = 20 * time.Second
+	outboxInterval = 20 * time.Second
 	// outboxWorkers bounds concurrent delivery so one unreachable recipient
 	// cannot hold up everyone else's messages behind it.
 	outboxWorkers = 3
@@ -69,10 +68,16 @@ func (s *Server) setDeliveryLocked(msgID, state string) {
 	}
 }
 
-// markDelivered clears the queue entry and the pending marker.
-func (s *Server) markDelivered(msgID string) {
+// markDelivered clears a queued item. directTo names the recipient when the
+// message went over a direct dial, so their presence is promoted under the same
+// lock; it is empty for a mailbox drop or a relay hand-off, neither of which
+// says anything about whether the recipient is reachable right now.
+func (s *Server) markDelivered(msgID, directTo string) {
 	s.sessMu.Lock()
 	defer s.sessMu.Unlock()
+	if directTo != "" {
+		s.touchPeerPresenceLocked(directTo, "direct send")
+	}
 	delete(s.outbox, msgID)
 	s.setDeliveryLocked(msgID, "")
 	s.persistLocked()
@@ -100,17 +105,9 @@ func (s *Server) recordAttempt(item chatstore.OutboxItem, cause string) {
 
 // outboxLoop drains the queue in the background for the life of the session.
 func (s *Server) outboxLoop(ctx context.Context, id *identity.Identity) {
-	t := time.NewTimer(outboxStartDelay)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			s.outboxTick(ctx, id)
-			t.Reset(outboxInterval)
-		}
-	}
+	s.runLoop(ctx, outboxInterval, func() {
+		s.outboxTick(ctx, id)
+	})
 }
 
 func (s *Server) outboxTick(ctx context.Context, id *identity.Identity) {
@@ -167,10 +164,14 @@ func (s *Server) deliverOutboxItem(ctx context.Context, id *identity.Identity, i
 	}
 	reply := replyOf(it)
 	dctx, dcancel := context.WithTimeout(ctx, budget)
-	err := protocol.SendMessage(dctx, s.onion.Dialer(), id, it.To, it.ID, it.Text, reply)
+	// v2 send: establishes a Double Ratchet session on first contact (X3DH) and
+	// uses it thereafter. With no legacy peers there is no v1 fallback — an
+	// establishment failure returns an error and the outbox retries, rather than
+	// silently downgrading to v1 static encryption.
+	err := s.sendV2(dctx, s.onion.Dialer(), id, it.To, it.ID, it.Text, reply)
 	dcancel()
 	if err == nil {
-		s.markDelivered(it.ID)
+		s.markDelivered(it.ID, it.To)
 		return
 	}
 
@@ -178,7 +179,7 @@ func (s *Server) deliverOutboxItem(ctx context.Context, id *identity.Identity, i
 	ok := s.tryMailboxDropoff(mctx, id, c, it.ID, it.Text, reply)
 	mcancel()
 	if ok {
-		s.markDelivered(it.ID)
+		s.markDelivered(it.ID, "")
 		return
 	}
 	s.recordAttempt(it, friendlySendError(err))

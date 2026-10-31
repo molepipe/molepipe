@@ -28,7 +28,7 @@ func msgHooks(allow func(string) bool, delivered chan<- [2]string) Hooks {
 		DisplayName:     func() string { return "" },
 		AllowMessage:    allow,
 		Deliver:         func(sender, _, text string, _ Reply) { delivered <- [2]string{sender, text} },
-		OnFriendRequest: func(string, string, string) error { return nil },
+		OnFriendRequest: func(string, string, string, string, string) error { return nil },
 		OnFriendAccept:  func(string, string, string) error { return nil },
 	}
 }
@@ -107,7 +107,7 @@ func TestReceiveRejectsForgedSender(t *testing.T) {
 	forged := Envelope{
 		Sender: alice.AccountNumber(), SenderDHPub: mdh[:], Nonce: ch.Nonce,
 		Sig: ed25519.Sign(mallory.Keys.Signing.Private,
-			signBlob([]byte(sigContext), []byte("message"), ch.Nonce, []byte(bob.AccountNumber()), mdh[:])),
+			signBlob(sigContextFor(protoVerCurrent), []byte("message"), ch.Nonce, []byte(bob.AccountNumber()), mdh[:])),
 		Box: []byte("x"),
 	}
 	if err := peer.Receive(forged); err == nil {
@@ -162,7 +162,7 @@ func TestProfileRoundTrip(t *testing.T) {
 	// its own DH key).
 	card := peer.ProfileCard()
 	ed, _ := identity.AccountNumberFromString(bob.AccountNumber())
-	tampered := signBlob([]byte(sigContext), []byte("profile"), []byte(card.Account), []byte(card.DisplayName), card.DHPub, []byte("deadbeef"))
+	tampered := signBlob(sigContextFor(protoVerCurrent), []byte("profile"), []byte(card.Account), []byte(card.DisplayName), card.DHPub, []byte("deadbeef"))
 	if ed25519.Verify(ed, tampered, card.Sig) {
 		t.Error("signature verified against a tampered avatar_hash")
 	}
@@ -188,7 +188,7 @@ func TestContactProfileGate(t *testing.T) {
 	srv := serve(t, peer)
 	dialer := fakeDialer{srv.Listener.Addr().String()}
 
-	cp, err := FetchContactProfile(context.Background(), dialer, alice, bob.AccountNumber())
+	cp, err := FetchContactProfile(context.Background(), dialer, alice.AccountNumber(), alice.Keys.Signing.Private, bob.AccountNumber())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +196,7 @@ func TestContactProfileGate(t *testing.T) {
 		t.Errorf("accepted contact got mailbox %q, want %q", cp.MailboxURL, mailbox)
 	}
 
-	cp2, err := FetchContactProfile(context.Background(), dialer, carol, bob.AccountNumber())
+	cp2, err := FetchContactProfile(context.Background(), dialer, carol.AccountNumber(), carol.Keys.Signing.Private, bob.AccountNumber())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +208,7 @@ func TestContactProfileGate(t *testing.T) {
 	// is consumed on first use.
 	ch := peer.Challenge()
 	sig := ed25519.Sign(alice.Keys.Signing.Private,
-		signBlob([]byte(sigContext), []byte("contact-profile"), ch.Nonce, []byte(bob.AccountNumber())))
+		signBlob(sigContextFor(protoVerCurrent), []byte("contact-profile"), ch.Nonce, []byte(bob.AccountNumber())))
 	req := ContactProfileRequest{From: alice.AccountNumber(), Nonce: ch.Nonce, Sig: sig}
 	if _, err := peer.ServeContactProfile(req); err != nil {
 		t.Fatalf("first use rejected: %v", err)
@@ -281,7 +281,7 @@ func TestAvatarUngatedMailboxGated(t *testing.T) {
 		t.Fatal("fetched avatar bytes differ")
 	}
 	// Gated: the same stranger gets no mailbox.
-	cp, err := FetchContactProfile(context.Background(), dialer, carol, bob.AccountNumber())
+	cp, err := FetchContactProfile(context.Background(), dialer, carol.AccountNumber(), carol.Keys.Signing.Private, bob.AccountNumber())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -306,6 +306,52 @@ func TestFetchAvatarRejectsTampered(t *testing.T) {
 	}
 }
 
+// The one-time invite token must survive the full sender→wire→receiver path:
+// SendFriendRequest serializes it, it crosses the pipe as an (unsigned) JSON
+// field, and ReceiveFriendRequest hands it to the OnFriendRequest hook — where
+// the burn/admit logic lives. Asserting round-trip encoding alone would miss a
+// dropped wire field; this drives the actual request.
+func TestFriendRequestCarriesInviteToken(t *testing.T) {
+	alice, _ := identity.New()
+	bob, _ := identity.New()
+
+	gotToken := make(chan string, 1)
+	peer := NewPeer(bob, Hooks{
+		DisplayName:    func() string { return "Bob" },
+		AllowMessage:   func(string) bool { return true },
+		Deliver:        func(string, string, string, Reply) {},
+		OnFriendAccept: func(string, string, string) error { return nil },
+		OnFriendRequest: func(_, _, _, inviteToken, _ string) error {
+			gotToken <- inviteToken
+			return nil
+		},
+	})
+	mux := http.NewServeMux()
+	mux.HandleFunc(ChallengePath, func(w http.ResponseWriter, r *http.Request) { _ = json.NewEncoder(w).Encode(peer.Challenge()) })
+	mux.HandleFunc(FriendRequestPath, func(w http.ResponseWriter, r *http.Request) {
+		var req FriendRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if err := peer.ReceiveFriendRequest(req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		}
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	const token = "one-time-tok_ABC-123"
+	if err := SendFriendRequest(context.Background(), fakeDialer{srv.Listener.Addr().String()}, alice.AccountNumber(), alice.Keys.Signing.Private, "Alice", "req-1", bob.AccountNumber(), token); err != nil {
+		t.Fatalf("send friend request: %v", err)
+	}
+	select {
+	case got := <-gotToken:
+		if got != token {
+			t.Fatalf("hook received token %q, want %q", got, token)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("friend request never reached the hook")
+	}
+}
+
 func buildEnvelope(sender, recipient *identity.Identity, ch Challenge, text string) Envelope {
 	var theirDH [32]byte
 	copy(theirDH[:], ch.DHPub)
@@ -314,6 +360,6 @@ func buildEnvelope(sender, recipient *identity.Identity, ch Challenge, text stri
 	box, _ := crypto.SealMessage(key, []byte(text), aad(sender.AccountNumber(), recipient.AccountNumber()))
 	dh := sender.Keys.DH.Public
 	sig := ed25519.Sign(sender.Keys.Signing.Private,
-		signBlob([]byte(sigContext), []byte("message"), ch.Nonce, []byte(recipient.AccountNumber()), dh[:]))
+		signBlob(sigContextFor(protoVerCurrent), []byte("message"), ch.Nonce, []byte(recipient.AccountNumber()), dh[:]))
 	return Envelope{Sender: sender.AccountNumber(), SenderDHPub: dh[:], Nonce: ch.Nonce, Sig: sig, Box: box}
 }

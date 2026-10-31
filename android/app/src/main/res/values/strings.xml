@@ -24,6 +24,11 @@
     <string name="req_channel_name">Requests</string>
     <string name="req_channel_desc">Alerts for friend requests and group invites.</string>
     <string name="notif_friend_request_text">wants to connect with you</string>
+    <string name="notif_friend_accept_text">accepted your friend request</string>
     <string name="notif_group_invite_title">Group invite</string>
     <string name="notif_group_invite_text">%1$s invited you to %2$s</string>
+
+    <!-- Shown when an image shared into the app can't be read (unsupported, too
+         large, or the sharing app revoked access before we got to it). -->
+    <string name="share_in_failed">Couldn\'t read that image.</string>
 </resources>

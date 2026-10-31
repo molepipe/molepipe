@@ -13,6 +13,7 @@ import (
 	"github.com/molepipe/molepipe/backend/internal/duress"
 	"github.com/molepipe/molepipe/backend/internal/identity"
 	"github.com/molepipe/molepipe/backend/internal/pin"
+	"github.com/molepipe/molepipe/backend/internal/runlog"
 	"github.com/molepipe/molepipe/backend/internal/unlockguard"
 	"github.com/molepipe/molepipe/backend/internal/wipe"
 )
@@ -85,7 +86,12 @@ func (s *Server) wipeAccountFiles() {
 	// left it behind would hand over the contact list it just destroyed. It is
 	// emptied rather than removed: this process still holds the file open, and
 	// a fresh install has one too.
-	_ = wipe.Truncate(filepath.Join(dir, LogFileName))
+	logPath := filepath.Join(dir, LogFileName)
+	_ = wipe.Truncate(logPath)
+	// The run log rotates, and the previous generation names the same accounts.
+	// Removed rather than emptied: a fresh install has no rotated log, so an
+	// empty one left behind would mark this directory as one that has been used.
+	_ = wipe.File(runlog.RotatedPath(logPath))
 	// Blobs held for friends. The directory goes back empty because a fresh
 	// install has one, and a missing directory is a difference someone can see.
 	relayDir := filepath.Join(dir, "relay")
@@ -190,5 +196,6 @@ func (s *Server) handleDeleteIdentity(w http.ResponseWriter, r *http.Request, id
 
 // LogFileName is the run log inside the data directory. A packaged app has no
 // terminal, so without a file on disk every diagnostic this project has relied
-// on would be invisible to the person running it.
+// on would be invisible to the person running it. It is opened through runlog,
+// which bounds it at two generations; wipeAccountFiles has to clear both.
 const LogFileName = "tormsg.log"

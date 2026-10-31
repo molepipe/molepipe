@@ -1,16 +1,19 @@
-//go:build android
+//go:build android || ios
 
-// Package artihost implements tor.OnionService for Android over the torhost
-// Rust shim (arti-client), linked via cgo. It is the Android counterpart of the
-// desktop torsidecar package: same interface, but the onion service runs
+// Package artihost implements tor.OnionService for Android and iOS over the
+// torhost Rust shim (arti-client), linked via cgo. It is the mobile counterpart
+// of the desktop torsidecar package: same interface, but the onion service runs
 // in-process through Arti's library instead of a child `arti` process. The
 // onion secret key is handed to native code as raw bytes and never enters the
-// JVM.
+// JVM (Android) or the Swift runtime (iOS).
 //
-// This file is compiled only for android and only by the gomobile build, which
-// links torhost/target/<abi>/libtorhost.a (see android/build-aar.sh and the
-// per-ABI ldflags_*.go files). It has never been compiled on the host — the
-// host build uses the nil stub in ../../../mobile/onion_stub.go.
+// This file is compiled only for android/ios and only by the gomobile build,
+// which links torhost/target/<abi>/libtorhost.a. On Android the per-ABI
+// ldflags_*.go files supply -ltorhost (see android/build-aar.sh); on iOS the
+// static library is linked at the Xcode layer (per-SDK LIBRARY_SEARCH_PATHS in
+// ios/project.yml), because device and simulator share one Go build tag
+// (ios && arm64) and so cannot be told apart by cgo. It has never been compiled
+// on the host — the host build uses the nil stub in ../../../mobile/onion_stub.go.
 package artihost
 
 /*
@@ -23,6 +26,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -60,7 +64,29 @@ type Host struct {
 	mu             sync.Mutex
 	handle         C.torhost_handle // nil unless running
 	serviceRunning bool             // true when the onion service is live
+
+	// Which service is live, so a caller about to publish can find out it is
+	// already published and skip the teardown — see ServingKey. Both are
+	// meaningful only while serviceRunning; they are cleared on every teardown
+	// so a stale pair can never vouch for a service that is gone.
+	servingPub  [32]byte // Ed25519 public key the live service publishes under
+	servingAddr string   // the live service's .onion address
+
+	lastReady   bool             // last observed torhost_ready value
+	lastState   tor.ServiceState // last observed torhost_service_state value
+	stateLogged bool             // whether lastState has been logged at least once
+
+	// Guards the log-mirroring goroutine so it is started at most once per
+	// process. It is deliberately never stopped: it must keep running across a
+	// lock and an onion-service restart, and the lines it mirrors (including the
+	// teardown ones) are exactly what a post-mortem needs.
+	drainOnce sync.Once
 }
+
+// How often the Rust log ring is polled for new lines. The ring holds 400, and
+// the loudest producer is the dial-retry path, so a few seconds is far short of
+// a window in which the ring could turn over and lose lines.
+const logDrainInterval = 5 * time.Second
 
 // New returns a Host rooted at dataDir (the app's files dir); Arti state lives
 // under dataDir/arti.
@@ -68,7 +94,64 @@ func New(dataDir string) *Host { return &Host{dataDir: dataDir} }
 
 // Prewarm triggers one-time global init (logger + rustls crypto provider) at
 // app startup so the first Start call does not pay the cost on the unlock path.
-func (h *Host) Prewarm() { C.torhost_prewarm() }
+func (h *Host) Prewarm() {
+	C.torhost_prewarm()
+	h.startLogDrain()
+}
+
+// startLogDrain mirrors the Rust log ring into the Go run log, once per process.
+//
+// The ring is 400 lines of process memory read through an authenticated HTTP
+// endpoint, so on a phone the native side's diagnostics — onion-service status
+// transitions, descriptor-upload failures, start errors — exist only while the
+// app is running and only for whoever can open the UI. That made a real failure
+// (a service with live intro points whose descriptor never published) impossible
+// to investigate from a log pulled off the device. Mirrored into the run log
+// they sit alongside the Go lines that give them context, in the one file that
+// already carries this history.
+//
+// The desktop sidecar needs none of this: its LogLines reads arti.log, which is
+// already a file on disk.
+//
+// Note the destination. tormsg.log lives in the app's data dir, so it is erased
+// by an account removal and by a duress wipe — which is why mirroring there is
+// safe, and why these lines must never be sent to logcat instead: logcat
+// survives both, and dial failures name the peers this account talks to.
+func (h *Host) startLogDrain() {
+	h.drainOnce.Do(func() { go h.drainLogRing() })
+}
+
+func (h *Host) drainLogRing() {
+	ticker := time.NewTicker(logDrainInterval)
+	defer ticker.Stop()
+
+	var prev []string
+	// Base text and already-mirrored count of the newest line, so a message that
+	// keeps repeating can be re-reported as it grows (see below).
+	var lastBase string
+	var lastCount int
+
+	for range ticker.C {
+		cur := h.LogLines()
+		if len(cur) == 0 {
+			continue
+		}
+		for _, line := range newRingLines(prev, cur) {
+			log.Printf("tor: %s", line)
+			lastBase, lastCount = ringBase(line)
+		}
+		// A retry loop re-logging one failure does not append to the ring, it
+		// bumps the newest line's count in place — so a storm would otherwise
+		// appear in the log as a single line. Re-report it each time the count
+		// doubles: enough to show a storm and to date its growth, while staying
+		// logarithmic in the number of retries rather than one line per retry.
+		if base, n := ringBase(cur[len(cur)-1]); base == lastBase && n >= lastCount*2 {
+			log.Printf("tor: %s (x%d)", base, n)
+			lastCount = n
+		}
+		prev = cur
+	}
+}
 
 // Start publishes the onion service under key, forwarding the virtual port to
 // localAddr ("127.0.0.1:PORT"), and returns the .onion address. If the TorClient
@@ -84,9 +167,23 @@ func (h *Host) Start(ctx context.Context, key tor.OnionKey, localAddr string) (s
 		return "", fmt.Errorf("parse local port %q: %w", portStr, err)
 	}
 
+	// Prewarm normally starts this at app launch; do it here too so a caller
+	// that skips Prewarm still gets the native diagnostics in the run log.
+	h.startLogDrain()
+
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.serviceRunning {
+		// Already publishing this very key: hand back the address it is already
+		// published under instead of failing. The caller wants a published
+		// service and there is one, so there is nothing to do. A DIFFERENT key
+		// means two identities in one process (a duress decoy, a restore, a
+		// pairing) and must still be refused — publishing it here would leave
+		// the previous account's descriptor on the HSDirs under a service the
+		// caller believes it replaced.
+		if h.servingPub == key.Public && h.servingAddr != "" {
+			return h.servingAddr, nil
+		}
 		return "", errors.New("onion host already started")
 	}
 
@@ -121,6 +218,8 @@ func (h *Host) Start(ctx context.Context, key tor.OnionKey, localAddr string) (s
 
 	h.handle = handle
 	h.serviceRunning = true
+	h.servingPub = key.Public
+	h.servingAddr = onion
 	return onion, nil
 }
 
@@ -144,7 +243,66 @@ func (h *Host) startServiceLocked(key tor.OnionKey, port uint64) (string, error)
 	onion := C.GoString(cOnion)
 	C.torhost_free_string(cOnion)
 	h.serviceRunning = true
+	h.servingPub = key.Public
+	h.servingAddr = onion
 	return onion, nil
+}
+
+// StartExtraService launches an additional onion service (a rotation alias)
+// alongside the primary account service, on the existing bootstrapped client,
+// forwarding its inbound streams to localAddr. nickname MUST be unique across
+// the primary and every live alias (arti keys hidden-service state by nickname).
+// Returns the alias's .onion address and an opaque id to pass to
+// StopExtraService. Requires the client to be up (Start or StartClient first).
+//
+// This is not part of the tor.OnionService interface; the api layer reaches it
+// via an optional upcast, so hosts that don't implement it (torsidecar, the
+// no-tor path) simply don't offer rotation.
+func (h *Host) StartExtraService(key tor.OnionKey, localAddr, nickname string) (string, uint64, error) {
+	_, portStr, err := net.SplitHostPort(localAddr)
+	if err != nil {
+		return "", 0, fmt.Errorf("parse local addr %q: %w", localAddr, err)
+	}
+	port, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil {
+		return "", 0, fmt.Errorf("parse local port %q: %w", portStr, err)
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.handle == nil {
+		return "", 0, errors.New("torhost not started")
+	}
+
+	cNick := C.CString(nickname)
+	defer C.free(unsafe.Pointer(cNick))
+
+	var cOnion *C.char
+	id := C.torhost_start_extra_service(
+		h.handle, cNick,
+		(*C.uint8_t)(unsafe.Pointer(&key.ExpandedSecret[0])), C.size_t(len(key.ExpandedSecret)),
+		C.uint16_t(port), &cOnion,
+	)
+	if id == 0 {
+		return "", 0, errors.New("torhost failed to start the alias onion service")
+	}
+	// Zero the expanded secret from the Go heap now that Rust has copied it.
+	crypto.Zero(key.ExpandedSecret[:])
+	onion := C.GoString(cOnion)
+	C.torhost_free_string(cOnion)
+	return onion, uint64(id), nil
+}
+
+// StopExtraService tears down a single rotation alias by the id returned from
+// StartExtraService (aborts its forwarder and unpublishes it). It does not
+// disturb the primary service or any other alias. A no-op for an unknown id.
+func (h *Host) StopExtraService(id uint64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.handle == nil {
+		return
+	}
+	C.torhost_stop_service_by_id(h.handle, C.uint64_t(id))
 }
 
 // StartClient brings Tor up in dial-out-only mode for a secondary device: it
@@ -152,6 +310,8 @@ func (h *Host) startServiceLocked(key tor.OnionKey, port uint64) (string, error)
 // publishing the account onion (which would collide with the primary on the
 // HSDir hashring). Idempotent: returns nil if the client is already alive.
 func (h *Host) StartClient(ctx context.Context) error {
+	h.startLogDrain()
+
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.handle != nil {
@@ -175,7 +335,41 @@ func (h *Host) Ready() bool {
 	if h.handle == nil {
 		return false
 	}
-	return C.torhost_ready(h.handle) != 0
+	ready := C.torhost_ready(h.handle) != 0
+	if ready != h.lastReady {
+		h.lastReady = ready
+		st := tor.ServiceState(C.torhost_service_state(h.handle))
+		log.Printf("tor: ready transitioned to %v (service state: %v)", ready, st)
+	}
+	return ready
+}
+
+// ServiceState reports arti's own view of the onion service's publication
+// state, for the publish watchdog's restart decision. It is deliberately not
+// part of tor.OnionService — the desktop sidecar cannot answer — so callers
+// reach it through an interface assertion and fall back when it is absent.
+// Returns tor.StateUnknown when no handle is live or in client-only mode.
+func (h *Host) ServiceState() tor.ServiceState {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.handle == nil {
+		return tor.StateUnknown
+	}
+	st := tor.ServiceState(C.torhost_service_state(h.handle))
+	if !h.stateLogged || st != h.lastState {
+		h.stateLogged = true
+		h.lastState = st
+		log.Printf("tor: service state transitioned to %v", st)
+	}
+	return st
+}
+
+// SetTraceFilter configures Arti's internal tracing filter dynamically at runtime.
+// An empty spec or "off" disables the bridge.
+func (h *Host) SetTraceFilter(spec string) {
+	cs := C.CString(spec)
+	defer C.free(unsafe.Pointer(cs))
+	C.torhost_set_trace_filter(cs)
 }
 
 // Dialable reports whether outbound circuits can be built yet (send-ready). See
@@ -313,6 +507,8 @@ func (h *Host) Stop() error {
 	C.torhost_stop(h.handle)
 	h.handle = nil
 	h.serviceRunning = false
+	h.servingPub = [32]byte{}
+	h.servingAddr = ""
 	return nil
 }
 
@@ -328,7 +524,32 @@ func (h *Host) StopService() error {
 	}
 	C.torhost_stop_service(h.handle)
 	h.serviceRunning = false
+	h.servingPub = [32]byte{}
+	h.servingAddr = ""
 	return nil
+}
+
+// ServingKey reports the public key and .onion address of the live onion
+// service. running is false when nothing is published, in which case the other
+// two values are zero and must not be used.
+//
+// It exists so the api layer can tell "this service is already published under
+// exactly the key I was about to publish" from "this is a different service",
+// and skip a teardown-and-republish in the first case. Comparing the key
+// matters: re-unlocking the same account is not the only way back into
+// startOnion, and a duress decoy or a restore arrives with a different
+// identity in the same process.
+//
+// Not part of the tor.OnionService interface; the api layer reaches it via an
+// optional upcast, so a host that does not implement it (torsidecar) simply
+// keeps the old teardown-and-republish behaviour.
+func (h *Host) ServingKey() (pub [32]byte, onion string, running bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if !h.serviceRunning {
+		return [32]byte{}, "", false
+	}
+	return h.servingPub, h.servingAddr, true
 }
 
 // IsAlive reports whether the underlying TorClient is running (the handle is

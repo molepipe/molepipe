@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/molepipe/molepipe/backend/internal/identity"
 	"github.com/molepipe/molepipe/backend/internal/tor"
@@ -88,6 +89,15 @@ func authHdr(s *Server, tok string) map[string]string {
 	return map[string]string{"Origin": s.origin(), "Authorization": "Bearer " + tok}
 }
 
+// codeOf returns s's current shareable friend code (the invite code carrying its
+// live token). The account is only addable via a current code now, so any test
+// that establishes a friendship through the real send path must send this, not
+// the bare account number.
+func codeOf(t *testing.T, s *Server, tok string) string {
+	t.Helper()
+	return decode(t, s.do(t, "GET", "/api/invite-code", "", authHdr(s, tok)).Body)["code"].(string)
+}
+
 func contactStatus(t *testing.T, s *Server, tok, account string) string {
 	t.Helper()
 	body := decode(t, s.do(t, "GET", "/api/contacts", "", authHdr(s, tok)).Body)
@@ -103,10 +113,30 @@ func contactStatus(t *testing.T, s *Server, tok, account string) string {
 // The bug: B accepts while unable to reach A, so A never learns and is stuck at
 // pending_out forever — and A cannot repair it, because the only self-heal path
 // is an inbound message, which A is not allowed to send.
+// Lookup is now on the critical path for every add: a bare account is no longer
+// addable, so the UI resolves a friend code through /api/lookup before sending.
+// This guards that handleLookup parses the code, dials the account inside it, and
+// returns the bare account for display.
+func TestLookupResolvesFriendCode(t *testing.T) {
+	sA, sB, _, accB, tokA, tokB, _ := newPair(t)
+
+	code := codeOf(t, sB, tokB)
+	if code == accB {
+		t.Fatalf("expected a friend code carrying a token, got the bare account %q", code)
+	}
+	r := sA.do(t, "POST", "/api/lookup", `{"account":"`+code+`"}`, authHdr(sA, tokA))
+	if r.Code != http.StatusOK {
+		t.Fatalf("lookup by code: %d (%s)", r.Code, r.Body)
+	}
+	if got := decode(t, r.Body)["account"]; got != accB {
+		t.Fatalf("lookup should return B's bare account %q, got %v", accB, got)
+	}
+}
+
 func TestAcceptPushRetriesUntilItLands(t *testing.T) {
 	sA, sB, accA, accB, tokA, tokB, bOnion := newPair(t)
 
-	if r := sA.do(t, "POST", "/api/friend-requests/send", `{"account":"`+accB+`"}`, authHdr(sA, tokA)); r.Code != http.StatusOK {
+	if r := sA.do(t, "POST", "/api/friend-requests/send", `{"account":"`+codeOf(t, sB, tokB)+`"}`, authHdr(sA, tokA)); r.Code != http.StatusOK {
 		t.Fatalf("send request: %d (%s)", r.Code, r.Body)
 	}
 
@@ -162,7 +192,7 @@ func TestPendingAcceptSurvivesRestart(t *testing.T) {
 	sA, sB, accA, accB, tokA, tokB, bOnion := newPair(t)
 	_ = accB
 
-	sA.do(t, "POST", "/api/friend-requests/send", `{"account":"`+accB+`"}`, authHdr(sA, tokA))
+	sA.do(t, "POST", "/api/friend-requests/send", `{"account":"`+codeOf(t, sB, tokB)+`"}`, authHdr(sA, tokA))
 	bOnion.up.Store(false)
 	sB.do(t, "POST", "/api/friend-requests/accept", `{"account":"`+accA+`"}`, authHdr(sB, tokB))
 
@@ -190,7 +220,7 @@ func TestPendingAcceptSurvivesRestart(t *testing.T) {
 func TestRefusedAcceptIsDroppedNotRetriedForever(t *testing.T) {
 	sA, sB, accA, accB, tokA, tokB, bOnion := newPair(t)
 
-	sA.do(t, "POST", "/api/friend-requests/send", `{"account":"`+accB+`"}`, authHdr(sA, tokA))
+	sA.do(t, "POST", "/api/friend-requests/send", `{"account":"`+codeOf(t, sB, tokB)+`"}`, authHdr(sA, tokA))
 	bOnion.up.Store(false)
 	sB.do(t, "POST", "/api/friend-requests/accept", `{"account":"`+accA+`"}`, authHdr(sB, tokB))
 
@@ -235,7 +265,7 @@ func TestRefusedAcceptIsDroppedNotRetriedForever(t *testing.T) {
 func TestTransportFailureResetsRefusalCount(t *testing.T) {
 	sA, sB, accA, accB, tokA, tokB, bOnion := newPair(t)
 
-	sA.do(t, "POST", "/api/friend-requests/send", `{"account":"`+accB+`"}`, authHdr(sA, tokA))
+	sA.do(t, "POST", "/api/friend-requests/send", `{"account":"`+codeOf(t, sB, tokB)+`"}`, authHdr(sA, tokA))
 	bOnion.up.Store(false)
 	sB.do(t, "POST", "/api/friend-requests/accept", `{"account":"`+accA+`"}`, authHdr(sB, tokB))
 	idB, _ := sB.vault.get(tokB)
@@ -260,5 +290,35 @@ func TestTransportFailureResetsRefusalCount(t *testing.T) {
 	sB.acceptRetryTick(context.Background(), idB)
 	if got := contactStatus(t, sA, tokA, accB); got != "accepted" {
 		t.Fatalf("A should be accepted once reachable, got %q", got)
+	}
+}
+
+// The reported symptom was "nothing comes back to the other device to say they
+// approved it". Delivery is only half of that: when the accept does land, the
+// requester must be told, not just silently flipped — the shell posts a system
+// notification from this hook, the way it does for an inbound request.
+func TestAcceptFiresTheRequestersNotificationHook(t *testing.T) {
+	sA, sB, accA, accB, tokA, tokB, bOnion := newPair(t)
+	bOnion.up.Store(true) // B can reach A, so the accept lands on the first push
+
+	got := make(chan string, 1)
+	sA.SetFriendAcceptHook(func(name string) { got <- name })
+
+	if r := sA.do(t, "POST", "/api/friend-requests/send", `{"account":"`+codeOf(t, sB, tokB)+`"}`, authHdr(sA, tokA)); r.Code != http.StatusOK {
+		t.Fatalf("send request: %d (%s)", r.Code, r.Body)
+	}
+	if r := sB.do(t, "POST", "/api/friend-requests/accept", `{"account":"`+accA+`"}`, authHdr(sB, tokB)); r.Code != http.StatusOK {
+		t.Fatalf("accept: %d (%s)", r.Code, r.Body)
+	}
+	if st := contactStatus(t, sA, tokA, accB); st != "accepted" {
+		t.Fatalf("A should be accepted, got %q", st)
+	}
+	select {
+	case name := <-got:
+		if name == "" {
+			t.Error("the hook fired with an empty name")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the accept landed but the requester's notification hook never fired")
 	}
 }

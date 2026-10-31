@@ -59,5 +59,31 @@ liblzma = { version = "=0.4.8", features = ["static"] }
 rustls = { version = "0.23", features = ["ring"] }
 log = "0.4"
 
+# arti reports its internals through `tracing`, not `log`, so none of it reaches
+# our `log` ring buffer. Without this bridge an onion-service failure arrives as
+# the bare status-layer summary — a `Problem::Ipt` with an EMPTY error list
+# renders as "intro point failure" with no cause at all, which is a diagnostic
+# dead end. `registry` is what a Layer composes onto; `std` is what `Targets`
+# needs. Both crates are already in Cargo.lock via tor-rtmock's tracing-test, so
+# this pulls in no new dependency. Deliberately NOT the `tracing-log` feature:
+# see ensure_trace_bridge for why we must not install a LogTracer.
+# The facade, for its `STATIC_MAX_LEVEL`: the `release_max_level_*` features
+# strip events at the MACRO site, so if one were ever enabled in this graph no
+# subscriber or filter could recover arti's output and an empty capture would
+# look identical to arti having nothing to say. Reported at runtime rather than
+# trusted, because a dependency bump can turn it on silently. Already in the
+# graph via arti; also what the bridge test emits through.
+tracing = "0.1"
+tracing-core = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
+
+[dev-dependencies]
+# Test-only: lets us assert that the net params we override are ones arti
+# actually recognizes, and that the value survives its bounds check. A
+# misspelled or out-of-range key is otherwise silent — arti logs it at debug
+# and carries on with the consensus default. Same exact versions as above.
+tor-netdir = "=0.45.0"
+tor-netdoc = "=0.45.0"
+
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.14"

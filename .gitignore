@@ -39,6 +39,14 @@ android/.idea/
 /dist/
 .aider*
 
+# iOS build outputs (generated on macOS from committed sources)
+/ios/Mobile.xcframework/
+/ios/Molepipe.xcodeproj/
+/ios/build/
+# iOS torhost static libs (cross-compiled by ios/build-torhost.sh)
+/backend/internal/tor/artihost/lib/ios-arm64/
+/backend/internal/tor/artihost/lib/iossim-arm64/
+
 # Review screenshots — real account data (onion address, personal photos,
 # contact names). Kept local, never committed.
 /screenshots/

@@ -1,6 +1,7 @@
 package crypto
 
 import (
+	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
@@ -51,7 +52,7 @@ func SealMessage(key, plaintext, aad []byte) ([]byte, error) {
 // OpenMessage decrypts nonce‖ciphertext produced by SealMessage. A wrong key or
 // any tampering fails authentication.
 func OpenMessage(key, box, aad []byte) ([]byte, error) {
-	aead, err := chacha20poly1305.NewX(key)
+	aead, err := newAEAD(key)
 	if err != nil {
 		return nil, err
 	}
@@ -64,4 +65,9 @@ func OpenMessage(key, box, aad []byte) ([]byte, error) {
 		return nil, fmt.Errorf("decrypt failed (wrong key or tampered): %w", err)
 	}
 	return pt, nil
+}
+
+// newAEAD creates an XChaCha20-Poly1305 AEAD instance from a 32-byte key.
+func newAEAD(key []byte) (cipher.AEAD, error) {
+	return chacha20poly1305.NewX(key)
 }

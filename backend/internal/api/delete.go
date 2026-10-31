@@ -36,6 +36,11 @@ func (s *Server) hookOnDeleteMessage(from, messageID string) error {
 	s.sessMu.Lock()
 	defer s.sessMu.Unlock()
 
+	// Reached only after the protocol layer verified the signature and consumed
+	// the nonce, so this is authenticated direct traffic: promote presence before
+	// looking at the target, which we may legitimately no longer hold.
+	s.touchPeerPresenceLocked(from, "direct delete")
+
 	for i, m := range s.messages {
 		if m.ID != messageID {
 			continue

@@ -281,3 +281,45 @@ func TestGroupImageMessageIDDistinct(t *testing.T) {
 		t.Fatal("an image id collides with a text id")
 	}
 }
+
+// Merge is adopted wholesale by the sync path, so it must preserve the LOCAL
+// device's per-device crypto/delivery state (a = self) rather than let the adopt
+// wipe live ratchet sessions, prekeys, unacked inits, and the peer-alias tolerance
+// map. b's copies of these are per-device and must never be imported.
+func TestMergePreservesDeviceLocalState(t *testing.T) {
+	a := &Data{
+		RatchetSessions:  map[string][]byte{"peer": []byte("session-state")},
+		PendingInits:     map[string][]byte{"peer": []byte("init")},
+		ProcessedInits:   map[string][]byte{"peer": []byte("sig")},
+		PendingRotations: map[string]RotationPending{"peer": {}},
+		PeerAliases:      map[string]string{"oldalias": "newacct"},
+		Prekeys:          &PrekeyState{},
+		AutoRefresh:      true,
+		InviteToken:      "my-live-token",
+	}
+	b := &Data{
+		// Another device's crypto state — must NOT be imported.
+		RatchetSessions: map[string][]byte{"peer": []byte("THEIR-session")},
+		PeerAliases:     map[string]string{"other": "otheracct"},
+		// A secondary's stale invite-code state must never clobber the primary's.
+		AutoRefresh: false,
+		InviteToken: "STALE-token",
+	}
+	out := Merge(a, b)
+	if string(out.RatchetSessions["peer"]) != "session-state" {
+		t.Errorf("RatchetSessions not preserved from self: %v", out.RatchetSessions)
+	}
+	if _, imported := out.PeerAliases["other"]; imported {
+		t.Error("imported b's peer alias — device-local state must not cross devices")
+	}
+	if out.PeerAliases["oldalias"] != "newacct" {
+		t.Errorf("PeerAliases not preserved from self: %v", out.PeerAliases)
+	}
+	if out.Prekeys == nil || string(out.PendingInits["peer"]) != "init" ||
+		string(out.ProcessedInits["peer"]) != "sig" || len(out.PendingRotations) != 1 {
+		t.Error("prekeys/inits/pendingRotations not preserved from self")
+	}
+	if !out.AutoRefresh || out.InviteToken != "my-live-token" {
+		t.Errorf("invite-code state not preserved from self: autoRefresh=%v token=%q", out.AutoRefresh, out.InviteToken)
+	}
+}

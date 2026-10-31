@@ -14,7 +14,30 @@ import (
 var (
 	signingPath = []uint32{0, 0} // m/0'/0' — Ed25519 signing / identity key
 	dhPath      = []uint32{0, 1} // m/0'/1' — X25519 key-agreement key
+	// aliasBranch is the parent of the rotating account-address keys: each
+	// rotation alias is m/0'/2'/N' (Ed25519, becomes that alias's onion address).
+	// Index 2 is disjoint from signing (0) and DH (1), so aliases never collide
+	// with the durable identity keys. Deterministic in N, so a seed restore
+	// reproduces the current alias exactly. See DeriveAliasSigningKey.
+	aliasBranch = []uint32{0, 2}
 )
+
+// DeriveAliasSigningKey deterministically derives the Ed25519 signing keypair
+// for rotation alias `index` (path m/0'/2'/index'). Its public key becomes the
+// alias account number / onion address; its seed (Private.Seed()) feeds
+// tor.DeriveOnionKey to host the alias. The durable identity keys (signing at
+// m/0'/0', DH at m/0'/1') are unaffected by rotation.
+func DeriveAliasSigningKey(seed []byte, index uint32) (SigningKeyPair, error) {
+	var kp SigningKeyPair
+	path := append(append([]uint32(nil), aliasBranch...), index)
+	leaf, err := DeriveSLIP10Ed25519(seed, path...)
+	if err != nil {
+		return kp, fmt.Errorf("derive alias signing key %d: %w", index, err)
+	}
+	kp.Private = ed25519.NewKeyFromSeed(leaf)
+	kp.Public = kp.Private.Public().(ed25519.PublicKey)
+	return kp, nil
+}
 
 // SigningKeyPair is an Ed25519 identity keypair. Its public key is the account
 // identity and, in Phase 3, the v3 onion service key.

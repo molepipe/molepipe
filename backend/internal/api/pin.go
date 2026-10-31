@@ -150,6 +150,14 @@ func (s *Server) finishUnlock(w http.ResponseWriter, id *identity.Identity) {
 	// out the client can fire /api/lock at any moment. Only the slow part (Tor
 	// bootstrap) is backgrounded; the derive itself is microseconds.
 	onionKey, keyErr := onionKeyFor(id)
+	// Derive the rotation aliases' onion keys synchronously too, for the same
+	// reason: prepareLiveAliasesLocked reads the mnemonic, which a concurrent lock
+	// would zero the moment the token below is out. The keys are published (a
+	// network op) in the background after the Tor client is up. Nil when rotation
+	// has not started, or the host lacks concurrent-service support.
+	s.sessMu.Lock()
+	preparedAliases, aliasErr := s.prepareLiveAliasesLocked(id)
+	s.sessMu.Unlock()
 	// Hand back the token now: the UI transitions to the chat screen with a
 	// populated session while Tor bootstraps in the background.
 	writeJSON(w, http.StatusOK, map[string]string{
@@ -162,6 +170,10 @@ func (s *Server) finishUnlock(w http.ResponseWriter, id *identity.Identity) {
 	s.ready.Add(1)
 	go func() {
 		defer s.ready.Done()
+		// Scrub the prepared alias keys no matter which path we take out of here —
+		// the early returns below skip publishPreparedAliases (which also zeroes),
+		// so without this the live aliases' onion secrets leak for the session.
+		defer zeroPreparedAliases(preparedAliases)
 		if keyErr != nil {
 			log.Printf("derive onion key for tor: %v", keyErr)
 			return
@@ -170,7 +182,13 @@ func (s *Server) finishUnlock(w http.ResponseWriter, id *identity.Identity) {
 			log.Printf("onion service failed to start: %v", err)
 			return
 		}
-		s.startPublishWatchdog()
+		s.startPublishWatchdog(onionKey)
+		// The Tor client is up; republish the live rotation-alias set so an
+		// un-updated contact mid-grace can still reach us at an alias-of-us.
+		if aliasErr != nil {
+			log.Printf("rotation: derive live aliases: %v", aliasErr)
+		}
+		s.publishPreparedAliases(preparedAliases)
 	}()
 }
 

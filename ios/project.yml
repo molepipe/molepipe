@@ -37,6 +37,21 @@ targets:
         CODE_SIGN_STYLE: Automatic
         LD_RUNPATH_SEARCH_PATHS:
           - "@executable_path/Frameworks"
+        # torhost (Rust/Arti) static library. gomobile leaves the torhost_*
+        # symbols undefined in the static Mobile.xcframework; they are resolved
+        # here at app-link time. iOS device and simulator are BOTH ios/arm64, so
+        # the correct slice is selected by SDK below — cgo build tags cannot tell
+        # them apart, which is why the linking lives here and not in Go.
+        OTHER_LDFLAGS:
+          - "-ltorhost"
+        "LIBRARY_SEARCH_PATHS[sdk=iphoneos*]":
+          - "$(SRCROOT)/../backend/internal/tor/artihost/lib/ios-arm64"
+        "LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]":
+          - "$(SRCROOT)/../backend/internal/tor/artihost/lib/iossim-arm64"
     dependencies:
-      - framework: Molepipe.xcframework
-        embed: true
+      # gomobile emits a STATIC xcframework, so it is linked, not embedded. If a
+      # gomobile version emits a dynamic framework instead, set embed: true (see
+      # HANDOFF.md → Troubleshooting).
+      - framework: Mobile.xcframework
+        embed: false
+        link: true

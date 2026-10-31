@@ -10,9 +10,8 @@ import (
 )
 
 const (
-	mailboxStartDelay = 15 * time.Second // let Tor warm up before the first tick
-	mailboxInterval   = 60 * time.Second // check-in keeps the tenancy alive; pickup fetches mail
-	mailboxOpTimeout  = 90 * time.Second // per-tick budget for the mailbox round trips
+	mailboxInterval  = 60 * time.Second // check-in keeps the tenancy alive; pickup fetches mail
+	mailboxOpTimeout = 90 * time.Second // per-tick budget for the mailbox round trips
 )
 
 // mailboxLoop keeps our own mailbox alive (check-in) and pulls anything waiting
@@ -20,17 +19,9 @@ const (
 // no mailbox is configured, so enabling a mailbox in settings simply starts
 // having an effect on the next tick — no restart needed.
 func (s *Server) mailboxLoop(ctx context.Context, id *identity.Identity) {
-	t := time.NewTimer(mailboxStartDelay)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			s.mailboxTick(ctx, id)
-			t.Reset(mailboxInterval)
-		}
-	}
+	s.runLoop(ctx, mailboxInterval, func() {
+		s.mailboxTick(ctx, id)
+	})
 }
 
 func (s *Server) mailboxTick(ctx context.Context, id *identity.Identity) {
@@ -80,6 +71,26 @@ func (s *Server) mailboxTick(ctx context.Context, id *identity.Identity) {
 			continue
 		}
 		s.sessMu.Lock()
+		if c.Kind == protocol.MailKindRotation {
+			// A rotation announcement arrives sealed under the sender's NEW (not-yet-
+			// trusted) alias, so it can't clear the contacts-only gate on c.Sender. Its
+			// authenticity rests on the CHANNEL: the static-DH mailbox seal only opens
+			// for a holder of the sender's stable DHPub, so a successful open PROVES
+			// possession of that key. Resolve env.SenderDHPub (NEVER a payload field) to
+			// the accepted contact and apply. A genuine apply (or an idempotent dup,
+			// both err==nil) clears the box; anything unresolved/stale is left for TTL.
+			if acct, ok := s.lookupContactByDHPubLocked(env.SenderDHPub); ok {
+				if err := s.applyAddressRotationLocked(acct, c.Rotation.NewOnion, c.Rotation.AliasIndex); err == nil {
+					deliveredIDs = append(deliveredIDs, env.ID())
+					// Ack back over the session (best-effort) so the rotator's resend
+					// loop can stop; if we have no session yet, their next online resend
+					// re-triggers an ack. Same idempotent-must-ack rule as the direct path.
+					go s.deliverRotationAck(id, c.Rotation.NewOnion, c.Rotation.AliasIndex)
+				}
+			}
+			s.sessMu.Unlock()
+			continue
+		}
 		if s.allowMessageLocked(c.Sender) { // contacts-only gate, same as direct delivery
 			var stored bool
 			if c.Kind == protocol.MailKindImage {

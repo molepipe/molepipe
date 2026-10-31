@@ -48,17 +48,33 @@ func TestNegotiate(t *testing.T) {
 	}
 }
 
-// TestNegotiateVersionAtV1 pins the live behaviour: with the sole version being
-// 1, every advertisement resolves to 1 and nothing is ever rejected — the seam
-// is behaviour-neutral today.
-func TestNegotiateVersionAtV1(t *testing.T) {
+// TestNegotiateVersionCurrent pins the live behaviour: negotiateVersion returns
+// the highest mutually supported version. Absent Ver (0) is treated as
+// legacyVer (v1), which is within our v1-v2 window, so it succeeds.
+func TestNegotiateVersionCurrent(t *testing.T) {
 	for _, theirMax := range []uint16{0, 1, 2, 65535} {
 		v, err := negotiateVersion(theirMax)
+		if theirMax < protoVerMin && theirMax != 0 {
+			// Peer below our floor (and not absent): negotiation fails
+			if err == nil {
+				t.Fatalf("negotiateVersion(%d) should fail", theirMax)
+			}
+			continue
+		}
 		if err != nil {
 			t.Fatalf("negotiateVersion(%d) unexpected error: %v", theirMax, err)
 		}
-		if v != 1 {
-			t.Fatalf("negotiateVersion(%d) = %d, want 1", theirMax, v)
+		// theirMax=0 is treated as legacyVer=1, which is in window
+		effective := theirMax
+		if effective == 0 {
+			effective = 1 // legacyVer
+		}
+		want := effective
+		if want > protoVerCurrent {
+			want = protoVerCurrent
+		}
+		if v != want {
+			t.Fatalf("negotiateVersion(%d) = %d, want %d", theirMax, v, want)
 		}
 	}
 }
@@ -67,22 +83,36 @@ func TestVersionSupported(t *testing.T) {
 	if !versionSupported(1) {
 		t.Fatal("versionSupported(1) = false, want true")
 	}
+	if !versionSupported(2) {
+		t.Fatal("versionSupported(2) = false, want true")
+	}
 	if versionSupported(0) {
 		t.Fatal("versionSupported(0) = true, want false")
 	}
-	if versionSupported(2) {
-		t.Fatal("versionSupported(2) = true, want false")
+	if versionSupported(99) {
+		t.Fatal("versionSupported(99) = true, want false")
 	}
 }
 
-// TestCandidateVersions checks the hint-first fallback ordering. At v1 the list
-// is always exactly [1], whether the hint is present, absent, or bogus — so an
-// unsupported hint can never leave the verifier with nothing to try.
+// TestCandidateVersions checks the hint-first fallback ordering. At v1-v2 the
+// list includes both versions (hint first if supported, then highest-first),
+// so an unsupported hint still leaves the verifier with valid versions to try.
 func TestCandidateVersions(t *testing.T) {
 	for _, hint := range []uint16{0, 1, 2, 99} {
 		got := candidateVersions(hint)
-		if len(got) != 1 || got[0] != 1 {
-			t.Fatalf("candidateVersions(%d) = %v, want [1]", hint, got)
+		// Must contain exactly protoVerMin..protoVerCurrent
+		if len(got) != int(protoVerCurrent-protoVerMin)+1 {
+			t.Fatalf("candidateVersions(%d) length = %d, want %d", hint, len(got), int(protoVerCurrent-protoVerMin)+1)
+		}
+		// Must contain all supported versions
+		seen := make(map[uint16]bool)
+		for _, v := range got {
+			seen[v] = true
+		}
+		for v := protoVerMin; v <= protoVerCurrent; v++ {
+			if !seen[v] {
+				t.Fatalf("candidateVersions(%d) missing version %d", hint, v)
+			}
 		}
 	}
 }

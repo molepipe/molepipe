@@ -62,7 +62,7 @@ func TestMailEnvelopeLabelIsolation(t *testing.T) {
 	var ts [8]byte
 	binary.BigEndian.PutUint64(ts[:], uint64(m.SentAt))
 	// Same fields, wrong label ("message" instead of "mailbox-message").
-	directLabelBlob := signBlob([]byte(sigContext), []byte("message"), []byte(m.Recipient), m.SenderDHPub, ts[:], m.Box)
+	directLabelBlob := signBlob(sigContextFor(protoVerCurrent), []byte("message"), []byte(m.Recipient), m.SenderDHPub, ts[:], m.Box)
 	m.Sig = ed25519.Sign(alice.Keys.Signing.Private, directLabelBlob)
 
 	if _, _, _, _, err := OpenMailEnvelope(bob, m); err == nil {

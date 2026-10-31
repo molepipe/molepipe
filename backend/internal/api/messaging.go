@@ -13,12 +13,14 @@ import (
 	mathrand "math/rand"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	qrcode "github.com/skip2/go-qrcode"
 
 	"github.com/molepipe/molepipe/backend/internal/chatstore"
+	"github.com/molepipe/molepipe/backend/internal/crypto"
 	"github.com/molepipe/molepipe/backend/internal/device"
 	"github.com/molepipe/molepipe/backend/internal/identity"
 	"github.com/molepipe/molepipe/backend/internal/pin"
@@ -26,10 +28,15 @@ import (
 	"github.com/molepipe/molepipe/backend/internal/unlockguard"
 )
 
-// handleQR returns a PNG QR code of the account number (base64, so the UI can
-// use a data: URL). Generated in-process — no external calls.
+// handleQR returns a PNG QR code (base64, so the UI can use a data: URL) of the
+// current shareable friend code — the invite code carrying the live token, which
+// is what people scan to add you (the bare account alone is no longer addable).
+// Generated in-process — no external calls.
 func (s *Server) handleQR(w http.ResponseWriter, r *http.Request, id *identity.Identity) {
-	png, err := qrcode.Encode(id.AccountNumber(), qrcode.Medium, 256)
+	s.sessMu.Lock()
+	code := s.shareCodeLocked(s.advertisedAccountLocked(id))
+	s.sessMu.Unlock()
+	png, err := qrcode.Encode(code, qrcode.Medium, 256)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -126,25 +133,32 @@ func (s *Server) startSession(id *identity.Identity) {
 	s.reads = map[string]time.Time{}
 	s.presence = map[string]string{}
 	s.mailboxCheckedAt = map[string]time.Time{}
+	s.helloAt = map[string]time.Time{}
+	s.aliasServiceIDs = map[string]uint64{}
+	s.aliasSigningKeys = map[string]crypto.SigningKeyPair{}
+	s.localAliasAccounts = nil
 	s.attachNeed = nil
 	s.displayName = ""
 	s.mailboxURL = ""
 	s.avatarHash = ""
 	s.avatarBytesOwn = nil
 	s.peer = protocol.NewPeer(id, protocol.Hooks{
-		DisplayName:         s.hookDisplayName,
-		AvatarHash:          s.hookAvatarHash,
-		ContactMailbox:      s.hookContactMailbox,
-		AllowMessage:        s.hookAllowMessage,
-		Deliver:             s.deliverMessage,
-		OnFriendRequest:     s.hookOnFriendRequest,
-		OnFriendAccept:      s.hookOnFriendAccept,
-		OnRelayRequest:      s.hookOnRelayRequest,
-		OnRelayAccept:       s.hookOnRelayAccept,
-		OnDeleteMessage:     s.hookOnDeleteMessage,
-		OnReaction:          s.hookOnReaction,
-		OnGroupInvite:       s.hookOnGroupInvite,
-		OnGroupInviteAccept: s.hookOnGroupInviteAccept,
+		DisplayName:          s.hookDisplayName,
+		AvatarHash:           s.hookAvatarHash,
+		ContactMailbox:       s.hookContactMailbox,
+		OnPeerOnline:         s.hookPeerOnline,
+		AllowMessage:         s.hookAllowMessage,
+		Deliver:              s.deliverMessage,
+		OnFriendRequest:      s.hookOnFriendRequest,
+		OnFriendAccept:       s.hookOnFriendAccept,
+		OnRelayRequest:       s.hookOnRelayRequest,
+		OnRelayAccept:        s.hookOnRelayAccept,
+		OnDeleteMessage:      s.hookOnDeleteMessage,
+		OnReaction:           s.hookOnReaction,
+		OnGroupInvite:        s.hookOnGroupInvite,
+		OnGroupInviteAccept:  s.hookOnGroupInviteAccept,
+		OnAddressRotation:    s.hookOnAddressRotation,
+		OnAddressRotationAck: s.hookOnAddressRotationAck,
 	})
 	// The prober's first sweep blocks on sessMu until this function returns, so
 	// it always sees the fully-loaded contact set below regardless of start order.
@@ -183,6 +197,22 @@ func (s *Server) startSession(id *identity.Identity) {
 		s.sweepOrphanAvatarsLocked() // reclaim avatars orphaned by picture changes since last run
 	}
 	s.enrollSelfLocked(id) // ensure this device is in the linked-devices list
+
+	// v2 Double Ratchet: stand up the session manager (its persistence callbacks
+	// read/write the ratchetSessions map adopted above), ensure prekey material
+	// exists — generating the initial signed prekey + one-time pool on first v2
+	// unlock and rotating/refilling as needed — and inject the manager into the
+	// peer so inbound ratchet messages can be decrypted.
+	s.sessMgr = s.newSessionManager()
+	s.ensurePrekeysLocked(id)
+	// The invite code is always on, so it always needs a live token. Existing
+	// accounts predate the feature (empty token) and migrate here on first unlock.
+	// Done on this LOCAL-unlock path only — never in adoptDataLocked, which also
+	// runs for sync/pair adoption, where the device-local token is preserved from
+	// the local side by Merge and must not be re-minted on a secondary.
+	s.ensureInviteTokenLocked()
+	s.persistLocked()
+	s.peer.SetSessionManager(ratchetSessionManager{s})
 }
 
 // adoptDataLocked replaces live session state with the given Data. Caller holds
@@ -206,6 +236,7 @@ func (s *Server) adoptDataLocked(data *chatstore.Data) {
 	}
 	s.profileAt = data.Profile.UpdatedAt
 	s.backupBudget = data.Profile.GroupImageBackupBytes
+	s.mediaAutoSave = data.Profile.MediaAutoSave
 	s.contacts = map[string]chatstore.Contact{}
 	for _, c := range data.Contacts {
 		s.contacts[c.Account] = c
@@ -256,6 +287,41 @@ func (s *Server) adoptDataLocked(data *chatstore.Data) {
 	for _, it := range data.Outbox {
 		s.outbox[it.ID] = it
 	}
+	s.prekeys = data.Prekeys
+	s.ratchetSessions = map[string][]byte{}
+	for acct, blob := range data.RatchetSessions {
+		s.ratchetSessions[acct] = append([]byte(nil), blob...)
+	}
+	s.pendingInits = map[string][]byte{}
+	for acct, blob := range data.PendingInits {
+		s.pendingInits[acct] = append([]byte(nil), blob...)
+	}
+	s.processedInits = map[string][]byte{}
+	for acct, sig := range data.ProcessedInits {
+		s.processedInits[acct] = append([]byte(nil), sig...)
+	}
+	// NOTE (multi-device / Phase G): this replaces s.rotation but does NOT recompute
+	// the derived live set — localAliasAccounts (the receive gate), aliasServiceIDs,
+	// and aliasSigningKeys (the outbound signer cache). On the unlock path that is
+	// fine: finishUnlock calls prepareLiveAliasesLocked right after, which rebuilds
+	// them. On the mid-session /sync merge path (handleSyncExchange) it is NOT — a
+	// rotation adopted from a peer device would leave the derived set stale until the
+	// next unlock. Harmless today (rotation is single-device; /sync needs an enrolled
+	// peer, which Phase G has not built), but when device sync of rotation state lands
+	// this adopt must be followed by refreshLiveAliasesLocked + a re-cache of the
+	// current/history alias signing keys (and, for the publishing device only, a
+	// service reconcile). See [[rotating-identity-epic]].
+	s.rotation = data.Rotation
+	s.pendingRotations = map[string]chatstore.RotationPending{}
+	for acct, pr := range data.PendingRotations {
+		s.pendingRotations[acct] = pr
+	}
+	s.peerAliases = map[string]string{}
+	for old, cur := range data.PeerAliases {
+		s.peerAliases[old] = cur
+	}
+	s.autoRefresh = data.AutoRefresh
+	s.inviteToken = data.InviteToken
 }
 
 // enrollSelfLocked adds this device to the linked-devices list if it isn't
@@ -278,7 +344,7 @@ func (s *Server) enrollSelfLocked(id *identity.Identity) {
 // snapshotLocked builds a chatstore.Data from live session state. Caller holds sessMu.
 func (s *Server) snapshotLocked() *chatstore.Data {
 	data := &chatstore.Data{
-		Profile: chatstore.Profile{DisplayName: s.displayName, MailboxURL: s.mailboxURL, AvatarHash: s.avatarHash, AvatarBytes: s.avatarBytesOwn, UpdatedAt: s.profileAt, GroupImageBackupBytes: s.backupBudget},
+		Profile: chatstore.Profile{DisplayName: s.displayName, MailboxURL: s.mailboxURL, AvatarHash: s.avatarHash, AvatarBytes: s.avatarBytesOwn, UpdatedAt: s.profileAt, GroupImageBackupBytes: s.backupBudget, MediaAutoSave: s.mediaAutoSave},
 		Reads:   s.reads,
 		Devices: append([]chatstore.Device(nil), s.devices...),
 	}
@@ -302,6 +368,40 @@ func (s *Server) snapshotLocked() *chatstore.Data {
 	}
 	data.Deleted = s.snapshotDeleted()
 	data.Outbox = s.outboxSnapshotLocked()
+	data.Prekeys = s.prekeys
+	data.Rotation = s.rotation
+	if len(s.ratchetSessions) > 0 {
+		data.RatchetSessions = map[string][]byte{}
+		for acct, blob := range s.ratchetSessions {
+			data.RatchetSessions[acct] = append([]byte(nil), blob...)
+		}
+	}
+	if len(s.pendingInits) > 0 {
+		data.PendingInits = map[string][]byte{}
+		for acct, blob := range s.pendingInits {
+			data.PendingInits[acct] = append([]byte(nil), blob...)
+		}
+	}
+	if len(s.processedInits) > 0 {
+		data.ProcessedInits = map[string][]byte{}
+		for acct, sig := range s.processedInits {
+			data.ProcessedInits[acct] = append([]byte(nil), sig...)
+		}
+	}
+	if len(s.pendingRotations) > 0 {
+		data.PendingRotations = map[string]chatstore.RotationPending{}
+		for acct, pr := range s.pendingRotations {
+			data.PendingRotations[acct] = pr
+		}
+	}
+	if len(s.peerAliases) > 0 {
+		data.PeerAliases = map[string]string{}
+		for old, cur := range s.peerAliases {
+			data.PeerAliases[old] = cur
+		}
+	}
+	data.AutoRefresh = s.autoRefresh
+	data.InviteToken = s.inviteToken
 	return data
 }
 
@@ -320,12 +420,16 @@ func (s *Server) clearSession() {
 	s.reads = nil
 	s.presence = nil
 	s.mailboxCheckedAt = nil
+	s.helloAt = nil
+	s.probeBackoff = nil
 	s.devices = nil
 	s.displayName = ""
 	s.mailboxURL = ""
 	s.avatarHash = ""
 	s.avatarBytesOwn = nil
 	s.profileAt = time.Time{}
+	s.autoRefresh = false
+	s.inviteToken = ""
 	s.peer = nil
 	s.chat = nil
 	s.attach = nil
@@ -334,6 +438,19 @@ func (s *Server) clearSession() {
 	s.deleted = nil
 	s.outbox = nil
 	s.attachNeed = nil
+	s.prekeys = nil
+	s.ratchetSessions = nil
+	s.pendingInits = nil
+	s.processedInits = nil
+	// Zero the resident alias signing keys before dropping the map — this is the
+	// lock point where the mnemonic itself is also gone, so the cache must not
+	// outlive it.
+	for acct, kp := range s.aliasSigningKeys {
+		crypto.Zero(kp.Private)
+		delete(s.aliasSigningKeys, acct)
+	}
+	s.aliasSigningKeys = nil
+	s.sessMgr = nil
 }
 
 // persistLocked writes the full session snapshot. Caller holds sessMu.
@@ -404,18 +521,131 @@ func (s *Server) hookContactMailbox(sender string) string {
 	return s.mailboxURL
 }
 
+// hookPeerOnline marks a contact online from their signed presence hello. Called
+// by ServeProfileHello only after the stamp's freshness and signature verified,
+// so the sender is proven — but proving who is calling is not the same as wanting
+// to track them, so the accepted-contact gate still applies here.
+//
+// Upgrade-only, deliberately: this writes presenceOnline and nothing else, never
+// a downgrade. A hello proves THEY can reach US, which is not presence's usual
+// claim (that WE can reach them — see presenceState), and under asymmetric
+// reachability the two differ. Letting the hello only promote keeps the outbound
+// sweep authoritative: an over-optimistic hello is corrected by our own probe
+// within presenceInterval, while a correct one saves the minutes their descriptor
+// takes to reach the HSDir ring.
+// touchPeerPresenceLocked marks an accepted contact reachable as of now. Two
+// kinds of evidence reach here, and both are conclusive: an explicit presence
+// hello, and authenticated DIRECT traffic — a message, reaction or delete that
+// already cleared signature verification and nonce consumption before its hook
+// ran, which means the peer dialed our onion themselves.
+//
+// Indirectly delivered traffic must NOT come here: it proves only that the peer
+// was online when they dropped the blob off, which may be hours ago. The seam
+// that keeps them apart is this function's callers — the mailbox tick and
+// handleRelayDeliver call allowMessageLocked directly and so never touch
+// presence, while hookAllowMessage (direct inbound only) does.
+//
+// `reason` names the evidence for the log line; it is not a peer-controlled
+// string.
+//
+// Note this writes helloAt, so the sweep's helloStickiness window now also
+// holds a dot green after a single inbound message, not only after a hello.
+// That widening is deliberate: a signed message from someone proves reachability
+// at least as strongly as their hello does, and it is what stops a peer who is
+// actively talking to us from flickering offline on one failed probe.
+//
+// Caller must hold sessMu.
+func (s *Server) touchPeerPresenceLocked(sender, reason string) {
+	// A hello or resend from a contact's retired alias (they rotated, our ack was
+	// lost) resolves to the account we now know them by, same as an inbound
+	// message's gate does.
+	sender = s.resolvePeerAccountLocked(sender)
+	c, ok := s.contacts[sender]
+	if !ok || c.Status != chatstore.StatusAccepted {
+		return
+	}
+	if s.presence == nil {
+		s.presence = map[string]string{}
+	}
+	if s.helloAt == nil {
+		s.helloAt = map[string]time.Time{}
+	}
+	// Recorded for every touch, not just the ones that change the dot: the sweep
+	// reads this to decide whether to KEEP a contact online, so evidence arriving
+	// while they are already online is exactly what refreshes the window.
+	s.helloAt[sender] = time.Now()
+	// Evidence they are up, so the sweep's offline backoff for them is void: the
+	// next sweep dials them again at full cadence instead of waiting out a window
+	// that was accrued while they were genuinely gone. This is the reset that
+	// makes the backoff affordable — a peer who talks to us is never subject to it.
+	delete(s.probeBackoff, sender)
+	// Logged only on a real transition, and without naming the contact: the
+	// interesting fact in the field is WHEN something first moved a dot, and a
+	// line per sweep per contact would bury it. Bounded by the contact count
+	// either way — every path here needs a valid signature from an accepted
+	// contact.
+	if prev := s.presence[sender]; prev != presenceOnline {
+		log.Printf("presence %s: a contact proved itself reachable (presence %s -> %s)", reason, presenceOrUnknown(prev), presenceOnline)
+	}
+	s.presence[sender] = presenceOnline
+}
+
+func (s *Server) hookPeerOnline(sender string) {
+	s.sessMu.Lock()
+	defer s.sessMu.Unlock()
+	s.touchPeerPresenceLocked(sender, "hello")
+}
+
+// presenceOrUnknown labels the empty presence state for the log, so a transition
+// out of "never probed" is distinguishable from one out of a known state.
+func presenceOrUnknown(state string) string {
+	if state == "" {
+		return "unset"
+	}
+	return state
+}
+
+// rollupHelloReject counts one failed presence hello and logs the running total
+// at most once a minute. See the helloRejects field for why this is a rollup and
+// not a line per attempt.
+func (s *Server) rollupHelloReject() {
+	n := s.helloRejects.Add(1)
+	now := time.Now().Unix()
+	last := s.helloRejectFlush.Load()
+	if now-last < 60 {
+		return
+	}
+	// CAS so a burst across goroutines logs once, not once per racer; the loser
+	// just folds into the next rollup.
+	if !s.helloRejectFlush.CompareAndSwap(last, now) {
+		return
+	}
+	log.Printf("presence hello: %d rejected since start (freshness, signature or replay)", n)
+}
+
 // hookAllowMessage gates an inbound message and upgrades pending_out→accepted
 // (an inbound message from someone we've requested means they accepted us).
 func (s *Server) hookAllowMessage(sender string) bool {
 	s.sessMu.Lock()
 	defer s.sessMu.Unlock()
-	return s.allowMessageLocked(sender)
+	if !s.allowMessageLocked(sender) {
+		return false
+	}
+	// Only on the allowed path, and only for direct inbound: they dialed our
+	// onion and their signature checked out, so they are reachable right now —
+	// stronger evidence than the probe sweep's, and ~30s earlier than it.
+	s.touchPeerPresenceLocked(sender, "direct message")
+	return true
 }
 
 // allowMessageLocked gates an inbound message and upgrades pending_out→accepted.
 // Caller holds sessMu. Shared by the direct-message hook and the mailbox pickup
 // loop, so both apply identical contacts-only gating.
 func (s *Server) allowMessageLocked(sender string) bool {
+	// A resend from a contact's retired alias (they rotated, we migrated, our ack
+	// was lost) resolves to the account we now know them by so the gate recognises
+	// them; a stranger or current contact resolves to itself.
+	sender = s.resolvePeerAccountLocked(sender)
 	c, ok := s.contacts[sender]
 	if !ok {
 		return false
@@ -469,13 +699,10 @@ func (s *Server) deliverInboundLocked(sender, msgID, text string, at time.Time, 
 		}
 	}
 	s.messages = append(s.messages, m)
-	if s.onInbound != nil {
-		name := sender
+	if s.onInbound != nil && !s.notifyMutedLocked(sender) {
+		name := s.contactDisplayNameLocked(sender, sender)
 		avatarHash := ""
 		if c, ok := s.contacts[sender]; ok {
-			if c.Name != "" {
-				name = c.Name
-			}
 			avatarHash = c.AvatarHash
 		}
 		// Async: a listener that hops the JNI boundary into the Android shell must
@@ -493,9 +720,42 @@ func (s *Server) SetInboundHook(fn func(fromName, preview string, atMillis int64
 	s.onInbound = fn
 }
 
+// notifyMutedLocked reports whether system notifications are suppressed for
+// this sender. Muting is per-contact and applies ONLY to the notification: the
+// message is still stored, still syncs and still counts as unread, so a muted
+// conversation never loses anything. This is the only layer that can enforce it
+// — the Android listener is handed a display name, not an account. An unknown
+// account is never muted (a stranger's first contact must still be visible).
+// Caller holds sessMu.
+// contactDisplayNameLocked resolves the label to SHOW for an account: the user's
+// own nickname for them, else the name they published, else the supplied fallback
+// (usually the raw account, so a name is never empty). This is the Go-side twin of
+// app.js's contactLabel(), and both must exist: system notifications are posted
+// from here, never from the page, so a nickname applied only in JS would leave the
+// notification shade showing the peer's own name for them. Caller holds sessMu.
+func (s *Server) contactDisplayNameLocked(account, fallback string) string {
+	if c, ok := s.contacts[account]; ok {
+		if n := c.DisplayName(); n != "" {
+			return n
+		}
+	}
+	return fallback
+}
+
+func (s *Server) notifyMutedLocked(account string) bool {
+	c, ok := s.contacts[account]
+	return ok && c.Muted
+}
+
 // SetFriendRequestHook registers a callback for inbound friend requests.
 func (s *Server) SetFriendRequestHook(fn func(fromName string)) {
 	s.onFriendRequest = fn
+}
+
+// SetFriendAcceptHook registers a callback fired when a friend request we sent
+// is accepted.
+func (s *Server) SetFriendAcceptHook(fn func(fromName string)) {
+	s.onFriendAccept = fn
 }
 
 // SetGroupInviteHook registers a callback for inbound group invites.
@@ -503,7 +763,7 @@ func (s *Server) SetGroupInviteHook(fn func(inviterName, groupName string)) {
 	s.onGroupInvite = fn
 }
 
-func (s *Server) hookOnFriendRequest(from, name, reqID string) error {
+func (s *Server) hookOnFriendRequest(from, name, reqID, inviteToken, dialedAccount string) error {
 	s.sessMu.Lock()
 	defer s.sessMu.Unlock()
 	if existing, ok := s.contacts[from]; ok {
@@ -523,15 +783,40 @@ func (s *Server) hookOnFriendRequest(from, name, reqID string) error {
 			s.persistLocked()
 			return nil
 		}
-		// pending_in already: refresh it below (dedupe, no growth).
-	} else if s.countPendingInLocked() >= maxPendingIn {
-		return fmt.Errorf("too many pending requests")
+		// pending_in already: refresh it below (dedupe, no growth). The invite code
+		// is DELIBERATELY not re-checked on this path — a lost-response retry re-sends
+		// the same request bearing a token this device may have already rotated away,
+		// so re-checking would reject a request that in fact already landed.
+	} else {
+		// Brand-new inbound request. Enforce the invite code before growing the
+		// pending set, so a stale/tokenless request is turned away without consuming a
+		// pending_in slot. The account is not addable without a current code.
+		if s.countPendingInLocked() >= maxPendingIn {
+			return fmt.Errorf("too many pending requests")
+		}
+		if err := s.admitInviteTokenLocked(inviteToken); err != nil {
+			return err
+		}
 	}
-	s.putContactLocked(chatstore.Contact{Account: from, Name: name, Status: chatstore.StatusPendingIn, ReqID: reqID})
+	c := chatstore.Contact{Account: from, Name: name, Status: chatstore.StatusPendingIn, ReqID: reqID}
+	// Record which of OUR accounts the requester dialed, so our accept (and later
+	// sends) present that same account and never leak the primary. Only when it is a
+	// live alias: a primary dial keeps MyAccountKnown == "" (the primary sentinel),
+	// and an account we can't resolve to an index is left unset rather than stamped
+	// with an identity outboundIdentity would then fail loud on forever.
+	if s.sessID != nil && dialedAccount != s.sessID.AccountNumber() {
+		if idx, ok := s.aliasIndexForAccountLocked(dialedAccount); ok {
+			c.MyAccountKnown, c.MyAliasIndexKnown = dialedAccount, idx
+		}
+	}
+	s.putContactLocked(c)
 	s.persistLocked()
-	// Notify the Android shell so it can post a system notification.
+	// Notify the Android shell so it can post a system notification. Resolved
+	// through the contact record because a repeat request from an account already
+	// in pending_in may already carry a nickname the user gave it.
 	if fn := s.onFriendRequest; fn != nil {
-		go fn(name)
+		who := s.contactDisplayNameLocked(from, name)
+		go fn(who)
 	}
 	return nil
 }
@@ -550,6 +835,16 @@ func (s *Server) hookOnFriendAccept(from, name, reqID string) error {
 	}
 	s.putContactLocked(c)
 	s.persistLocked()
+	// Tell the shell so it can notify: this is the answer to a request the user
+	// sent, and it is the only moment it arrives. Falls back to the account the
+	// same way inbound messages do, so the notification is never nameless.
+	if fn := s.onFriendAccept; fn != nil {
+		who := c.DisplayName()
+		if who == "" {
+			who = from
+		}
+		go fn(who)
+	}
 	return nil
 }
 
@@ -563,24 +858,116 @@ func (s *Server) countPendingInLocked() int {
 	return n
 }
 
+// admitInviteTokenLocked enforces the invite code on a brand-new inbound request.
+// Strict: the request MUST present the current live token, so a tokenless (bare
+// account) or stale request — a forwarded/screenshotted code, or one rotated away
+// — is refused, and the account is not addable without a live code. The guard's
+// first clause (s.inviteToken == "") also rejects the degenerate empty==empty case
+// where an un-minted device would otherwise admit a tokenless request; keep this
+// ordering. On success, when AutoRefresh is on the token is rotated (the code works
+// once, then a fresh one appears) — a mint failure keeps the current token valid
+// rather than failing a legitimate add. The caller's persistLocked commits any
+// rotation alongside the new pending request. Caller holds sessMu.
+func (s *Server) admitInviteTokenLocked(token string) error {
+	if s.inviteToken == "" || token != s.inviteToken {
+		return fmt.Errorf("invite code is no longer valid")
+	}
+	if s.autoRefresh {
+		if tok, err := newInviteToken(); err != nil {
+			log.Printf("invite code: auto-refresh mint: %v", err)
+		} else {
+			s.inviteToken = tok
+		}
+	}
+	return nil
+}
+
+// ensureInviteTokenLocked guarantees a live token exists so the always-on invite
+// code always has something to show and admit against. It runs on the local-unlock
+// path only (see openStore), migrating accounts that predate the feature. Caller
+// holds sessMu.
+func (s *Server) ensureInviteTokenLocked() {
+	if s.inviteToken != "" {
+		return
+	}
+	tok, err := newInviteToken()
+	if err != nil {
+		log.Printf("invite code: initial mint: %v", err)
+		return
+	}
+	s.inviteToken = tok
+}
+
+// shareCodeLocked is the friend code this device hands out: always the versioned
+// code carrying the current live token. Falls back to the bare account only in the
+// brief pre-mint window (before the first unlock mints a token). Caller holds
+// sessMu. account is the current outbound account (id.AccountNumber() today).
+func (s *Server) shareCodeLocked(account string) string {
+	if s.inviteToken == "" {
+		return account
+	}
+	return protocol.EncodeInviteCode(account, s.inviteToken)
+}
+
+// newInviteToken mints a fresh invite secret: 16 random bytes rendered URL-safe
+// (no padding, no ':' so it survives the code's colon delimiter).
+func newInviteToken() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b[:]), nil
+}
+
 // --- peer-facing handlers (onion listener) ---
 
 func (s *Server) handleP2PChallenge(w http.ResponseWriter, r *http.Request) {
 	peer := s.currentPeer()
-	if peer == nil {
+	idn := s.currentIdentity()
+	if peer == nil || idn == nil {
 		http.Error(w, "locked", http.StatusServiceUnavailable)
 		return
 	}
-	writeJSON(w, http.StatusOK, peer.Challenge())
+	recipient, signPriv, err := s.responderForRequest(idn, r)
+	if err != nil {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable) // alias key not resident — fail loud, don't leak primary
+		return
+	}
+	writeJSON(w, http.StatusOK, peer.ChallengeAs(recipient, signPriv))
 }
 
 func (s *Server) handleP2PProfile(w http.ResponseWriter, r *http.Request) {
 	peer := s.currentPeer()
-	if peer == nil {
+	idn := s.currentIdentity()
+	if peer == nil || idn == nil {
 		http.Error(w, "locked", http.StatusServiceUnavailable)
 		return
 	}
-	writeJSON(w, http.StatusOK, peer.ProfileCard())
+	recipient, signPriv, err := s.responderForRequest(idn, r)
+	if err != nil {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable) // alias key not resident — fail loud, don't leak primary
+		return
+	}
+	// A presence hello may ride this GET (protocol.FetchProfileAs). Purely
+	// advisory: the verdict feeds a local counter and NOTHING else, and the card
+	// below is served identically whether the stamp is absent, valid or forged.
+	// Anything the caller could observe — an error status, a different body —
+	// would make this public endpoint an oracle for whether a given account is a
+	// contact of ours. A malformed ts or sig counts as a reject too: it is the
+	// same ambiguity to resolve in the field, a hello that arrived and did not
+	// land.
+	if q := r.URL.Query(); q.Get("from") != "" {
+		accepted := false
+		if ts, perr := strconv.ParseInt(q.Get("ts"), 10, 64); perr == nil {
+			if sig, derr := base64.RawURLEncoding.DecodeString(q.Get("sig")); derr == nil {
+				accepted = peer.ServeProfileHello(q.Get("from"), ts, sig)
+			}
+		}
+		if !accepted {
+			s.rollupHelloReject()
+		}
+	}
+	writeJSON(w, http.StatusOK, peer.ProfileCardAs(recipient, signPriv))
 }
 
 // handleP2PContactProfile serves the operational profile fields (mailbox URL)
@@ -666,10 +1053,11 @@ func (s *Server) handleP2PFriendAccept(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGetProfile(w http.ResponseWriter, r *http.Request, id *identity.Identity) {
 	s.sessMu.Lock()
 	name, mailbox, budget, avatar := s.displayName, s.mailboxURL, s.backupBudget, s.avatarHash
+	autoSave := s.mediaAutoSave
 	s.sessMu.Unlock()
 	// Hand-built subset (never marshals chatstore.Profile), so the own-avatar bytes
 	// that ride in Profile for /sync never leak into this UI poll — only the hash.
-	writeJSON(w, http.StatusOK, map[string]any{"account": id.AccountNumber(), "display_name": name, "mailbox_url": mailbox, "group_image_backup_bytes": budget, "avatar_hash": avatar})
+	writeJSON(w, http.StatusOK, map[string]any{"account": id.AccountNumber(), "display_name": name, "mailbox_url": mailbox, "group_image_backup_bytes": budget, "avatar_hash": avatar, "media_auto_save": autoSave})
 }
 
 func (s *Server) handleSetProfile(w http.ResponseWriter, r *http.Request, _ *identity.Identity) {
@@ -679,6 +1067,9 @@ func (s *Server) handleSetProfile(w http.ResponseWriter, r *http.Request, _ *ide
 		DisplayName           *string `json:"display_name"`
 		MailboxURL            *string `json:"mailbox_url"`
 		GroupImageBackupBytes *int64  `json:"group_image_backup_bytes"`
+		// MediaAutoSave is the global default for copying received images into the
+		// phone's gallery. Pointer like the rest: nil leaves it unchanged.
+		MediaAutoSave *bool `json:"media_auto_save"`
 		// Avatar is the base64 (std) of a client-cropped square image, or "" to
 		// clear. nil = leave unchanged, like the other pointer fields. The client
 		// does all image work (crop/downscale) — the Go backend is gomobile-
@@ -764,8 +1155,12 @@ func (s *Server) handleSetProfile(w http.ResponseWriter, r *http.Request, _ *ide
 		turnedOff = s.backupBudget > 0 && b == 0
 		s.backupBudget = b
 	}
+	if req.MediaAutoSave != nil {
+		s.mediaAutoSave = *req.MediaAutoSave
+	}
 	s.profileAt = time.Now() // for multi-device sync LWW
 	name, mailbox, budget, avatar := s.displayName, s.mailboxURL, s.backupBudget, s.avatarHash
+	autoSave := s.mediaAutoSave
 	if setAvatar {
 		// Changing or clearing our own picture orphans the previous own-avatar bytes
 		// (no contact references them); reclaim now so a long unlocked session can't
@@ -777,7 +1172,7 @@ func (s *Server) handleSetProfile(w http.ResponseWriter, r *http.Request, _ *ide
 	if turnedOff {
 		go s.purgeGroupImageBackups() // dials our onion; keep it off the request path
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"display_name": name, "mailbox_url": mailbox, "group_image_backup_bytes": budget, "avatar_hash": avatar})
+	writeJSON(w, http.StatusOK, map[string]any{"display_name": name, "mailbox_url": mailbox, "group_image_backup_bytes": budget, "avatar_hash": avatar, "media_auto_save": autoSave})
 }
 
 // handleRestoreGroupImages nudges an immediate restore of full group images from
@@ -813,7 +1208,12 @@ func (s *Server) handleLookup(w http.ResponseWriter, r *http.Request, _ *identit
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	if _, err := identity.AccountNumberFromString(req.Account); err != nil {
+	// The lookup field may hold a bare account number or a one-time invite code
+	// (mp1:<account>:<token>); we dial the account either way. The token isn't
+	// used here — it rides the eventual friend request (handleSendRequest); the
+	// frontend keeps the original code and posts it there so the token survives.
+	account, _ := protocol.ParseInviteCode(req.Account)
+	if _, err := identity.AccountNumberFromString(account); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid account number"})
 		return
 	}
@@ -832,13 +1232,13 @@ func (s *Server) handleLookup(w http.ResponseWriter, r *http.Request, _ *identit
 	var pr protocol.Profile
 	err := reachRetry(ctx, lookupAttemptTimeout, lookupRetryGap, func(actx context.Context) error {
 		var e error
-		pr, e = protocol.FetchProfile(actx, s.onion.Dialer(), req.Account)
+		pr, e = protocol.FetchProfile(actx, s.onion.Dialer(), account)
 		return e
 	})
 	if err != nil {
 		// The only prior record of a failed lookup was a bare status code, which
 		// made "why can't I reach anyone" undiagnosable without a packet capture.
-		log.Printf("lookup of %s failed after retries: %v", req.Account, err)
+		log.Printf("lookup of %s failed after retries: %v", account, err)
 		status, reason, msg := reachFailure(err, s.onion.Dialable(), "reach that account")
 		writeJSON(w, status, map[string]string{"error": msg, "reason": reason})
 		return
@@ -850,7 +1250,7 @@ func (s *Server) handleLookup(w http.ResponseWriter, r *http.Request, _ *identit
 	// fetch avatar bytes (the other is the presence sweep); both already dial the
 	// peer, so no render ever triggers a dial.
 	if pr.AvatarHash != "" {
-		if data, aerr := protocol.FetchAvatar(ctx, s.onion.Dialer(), req.Account, pr.AvatarHash); aerr == nil {
+		if data, aerr := protocol.FetchAvatar(ctx, s.onion.Dialer(), account, pr.AvatarHash); aerr == nil {
 			s.sessMu.Lock()
 			if s.avatarStore != nil {
 				_ = s.avatarStore.Put(pr.AvatarHash, data)
@@ -863,9 +1263,9 @@ func (s *Server) handleLookup(w http.ResponseWriter, r *http.Request, _ *identit
 				// best-effort and may be reclaimed by a later sweep; the frontend
 				// fetches them into an object URL right after this returns, and a
 				// re-lookup re-caches them, so the add-time face still does its job.
-				if c, ok := s.contacts[req.Account]; ok && c.AvatarHash != pr.AvatarHash {
+				if c, ok := s.contacts[account]; ok && c.AvatarHash != pr.AvatarHash {
 					c.AvatarHash = pr.AvatarHash
-					s.contacts[req.Account] = c
+					s.contacts[account] = c
 					s.persistLocked()
 				}
 			}
@@ -886,16 +1286,20 @@ func (s *Server) handleSendRequest(w http.ResponseWriter, r *http.Request, id *i
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	if _, err := identity.AccountNumberFromString(req.Account); err != nil {
+	// The account field may be a bare account number or a one-time invite code
+	// (mp1:<account>:<token>); ParseInviteCode splits either into the account we
+	// dial and the token we carry (empty for a bare account).
+	account, inviteToken := protocol.ParseInviteCode(req.Account)
+	if _, err := identity.AccountNumberFromString(account); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid account number"})
 		return
 	}
-	if req.Account == id.AccountNumber() {
+	if account == id.AccountNumber() {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "that's your own account"})
 		return
 	}
 	s.sessMu.Lock()
-	existing, ok := s.contacts[req.Account]
+	existing, ok := s.contacts[account]
 	name, dial := s.displayName, s.onion
 	s.sessMu.Unlock()
 	if ok && existing.Status == chatstore.StatusAccepted {
@@ -918,6 +1322,19 @@ func (s *Server) handleSendRequest(w http.ResponseWriter, r *http.Request, id *i
 		return
 	}
 
+	// Present our currently advertised account (the alias if rotated, else the
+	// primary), signed with that account's key, so a brand-new contact never learns
+	// our primary onion. Resolved once, up front, so every retry stamps the same
+	// identity and the pending_out record below matches what the peer will store.
+	s.sessMu.Lock()
+	fromAcct, signPriv, aliasIdx, isAlias, ierr := s.advertisedOutboundIdentityLocked(id)
+	s.sessMu.Unlock()
+	if ierr != nil {
+		log.Printf("friend request to %s: cannot resolve outbound identity: %v", account, ierr)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "identity unavailable — try again"})
+		return
+	}
+
 	// One reqID across all retries: a retry re-sends the SAME request (the peer
 	// dedups pending_in by account), so an attempt that landed but whose reply was
 	// lost isn't turned into a second distinct request.
@@ -925,18 +1342,24 @@ func (s *Server) handleSendRequest(w http.ResponseWriter, r *http.Request, id *i
 	ctx, cancel := deliveryContext(lookupTotalTimeout)
 	defer cancel()
 	err := reachRetry(ctx, lookupAttemptTimeout, lookupRetryGap, func(actx context.Context) error {
-		return protocol.SendFriendRequest(actx, dial.Dialer(), id, name, reqID, req.Account)
+		return protocol.SendFriendRequest(actx, dial.Dialer(), fromAcct, signPriv, name, reqID, account, inviteToken)
 	})
 	if err != nil {
 		// Never surface err.Error() to the UI: a StatusError carries the peer's own
 		// response body (peer-controlled bytes). Log it; show only our own copy.
-		log.Printf("friend request to %s failed after retries: %v", req.Account, err)
+		log.Printf("friend request to %s failed after retries: %v", account, err)
 		status, reason, msg := reachFailure(err, dial.Dialable(), "send the request")
 		writeJSON(w, status, map[string]string{"error": msg, "reason": reason})
 		return
 	}
 	s.sessMu.Lock()
-	s.putContactLocked(chatstore.Contact{Account: req.Account, Name: req.Name, Status: chatstore.StatusPendingOut, ReqID: reqID})
+	c := chatstore.Contact{Account: account, Name: req.Name, Status: chatstore.StatusPendingOut, ReqID: reqID}
+	if isAlias {
+		// Record which of our accounts this contact now knows us by, so later sends
+		// (accept, messages) present the same alias and never fall back to the primary.
+		c.MyAccountKnown, c.MyAliasIndexKnown = fromAcct, aliasIdx
+	}
+	s.putContactLocked(c)
 	s.persistLocked()
 	s.sessMu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]string{"status": "requested"})
@@ -974,7 +1397,13 @@ func (s *Server) handleAcceptRequest(w http.ResponseWriter, r *http.Request, id 
 	if dial != nil {
 		ctx, cancel := deliveryContext(2 * time.Minute)
 		defer cancel()
-		if err := protocol.SendFriendAccept(ctx, dial.Dialer(), id, name, reqID, req.Account); err != nil {
+		// Present the account this requester knows us by (the alias of ours they
+		// dialed, recorded as MyAccountKnown when their request landed), not the
+		// primary — so accepting a redeemed rotated code doesn't leak our real onion.
+		fromAcct, signPriv, ierr := s.outboundIdentity(id, req.Account)
+		if ierr != nil {
+			log.Printf("friend-accept push to %s: cannot resolve outbound identity, queued for retry: %v", req.Account, ierr)
+		} else if err := protocol.SendFriendAccept(ctx, dial.Dialer(), fromAcct, signPriv, name, reqID, req.Account); err != nil {
 			log.Printf("friend-accept push to %s failed, queued for retry: %v", req.Account, err)
 		} else {
 			notified = true
@@ -1011,7 +1440,10 @@ func (s *Server) handleListRequests(w http.ResponseWriter, r *http.Request, _ *i
 	out := []map[string]string{}
 	for _, c := range s.contacts {
 		if c.Status == chatstore.StatusPendingIn {
-			out = append(out, map[string]string{"account": c.Account, "name": c.Name})
+			// Nickname rides along like it does on the contacts list: a pending
+			// request can be from someone already nicknamed (they re-requested
+			// after a remove), and the row and its notification must agree.
+			out = append(out, map[string]string{"account": c.Account, "name": c.Name, "nickname": c.Nickname})
 		}
 	}
 	s.sessMu.Unlock()
@@ -1113,7 +1545,7 @@ func (s *Server) handleListContacts(w http.ResponseWriter, r *http.Request, _ *i
 			presence = presenceUnknown
 		}
 		out = append(out, map[string]any{
-			"account": c.Account, "name": c.Name, "status": c.Status,
+			"account": c.Account, "name": c.Name, "nickname": c.Nickname, "status": c.Status,
 			"unread": unread, "presence": presence, "mailbox_url": c.MailboxURL,
 			// The contact's avatar hash; the UI renders it via GET /api/avatar?h=…
 			// from the local cache, falling back to initials when absent/uncached.
@@ -1127,6 +1559,11 @@ func (s *Server) handleListContacts(w http.ResponseWriter, r *http.Request, _ *i
 			// True while we've accepted them but the accept push hasn't landed:
 			// they still see us as pending and can't message us yet.
 			"awaiting_accept": s.awaitingAcceptLocked(c.Account),
+			// Per-contact preferences owned by the friend profile pane. "muted"
+			// suppresses notifications only; "media_auto_save" is the tri-state
+			// override of the global default (see mediaPolicyOf).
+			"muted":           c.Muted,
+			"media_auto_save": mediaPolicyOf(c),
 		})
 	}
 	s.sessMu.Unlock()

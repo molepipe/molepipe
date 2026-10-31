@@ -11,6 +11,7 @@ import (
 
 	"github.com/molepipe/molepipe/backend/internal/duress"
 	"github.com/molepipe/molepipe/backend/internal/identity"
+	"github.com/molepipe/molepipe/backend/internal/runlog"
 )
 
 // dirEntries lists the data directory, for comparing a post-removal state
@@ -195,5 +196,44 @@ func TestForgetWithNoIdentityIsHarmless(t *testing.T) {
 	if r := s.do(t, "POST", "/api/forget-identity", `{"confirm":"DELETE"}`,
 		map[string]string{"Origin": s.origin()}); r.Code != http.StatusOK {
 		t.Fatalf("forget with no identity: got %d, want 200 (%s)", r.Code, r.Body)
+	}
+}
+
+// The run log rotates, so a used device can hold a previous generation full of
+// the peer addresses the wipe exists to destroy. It must not outlive the
+// account, and it must not be left behind as an empty file either: a fresh
+// install has no rotated log, so one sitting there marks the directory as used.
+func TestForgetRemovesTheRotatedRunLog(t *testing.T) {
+	s, pw := newTestServer(t)
+	dir := s.store.Dir
+	rotated := runlog.RotatedPath(filepath.Join(dir, LogFileName))
+
+	secret := "dial failed for " + strings.Repeat("a", 40) + ".onion"
+	if err := os.WriteFile(rotated, []byte(secret), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// And a live log, which is emptied in place rather than removed.
+	if err := os.WriteFile(filepath.Join(dir, LogFileName), []byte(secret), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	token := unlockWithPassword(t, s, pw)
+	s.do(t, "POST", "/api/lock", "", map[string]string{"Origin": s.origin(), "Authorization": "Bearer " + token})
+	if r := s.do(t, "POST", "/api/forget-identity", `{"confirm":"DELETE"}`,
+		map[string]string{"Origin": s.origin()}); r.Code != http.StatusOK {
+		t.Fatalf("forget: %d", r.Code)
+	}
+
+	if _, err := os.Stat(rotated); !os.IsNotExist(err) {
+		t.Errorf("the rotated run log survived an account removal (err=%v)", err)
+	}
+	// The live log stays, emptied: this process holds it open and a fresh
+	// install has one too.
+	b, err := os.ReadFile(filepath.Join(dir, LogFileName))
+	if err != nil {
+		t.Fatalf("live log: %v", err)
+	}
+	if len(b) != 0 {
+		t.Errorf("live run log = %d bytes, want emptied", len(b))
 	}
 }

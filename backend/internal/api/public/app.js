@@ -2,10 +2,30 @@
 
 // Session token lives in memory only (not localStorage) so it disappears when
 // the tab closes. Theme prefs are non-sensitive and do use localStorage.
+//
+// On the Android shell it is additionally mirrored into the shell's own
+// process-scoped holder, because there the tab gets rebuilt for reasons nobody
+// thinks of as closing it (any configuration change outside MainActivity's
+// configChanges list destroys the Activity and its WebView), and the new page
+// would ask for the PIN again while the vault was still unlocked. That holder
+// is memory-only too and dies with the process, which is both when the tab is
+// really gone and when the vault's keys are zeroed — so this keeps the rule
+// above rather than relaxing it. See ShellSession.kt.
 let sessionToken = null;
+
+// setSessionToken is the only way the token should be written: it keeps the
+// Android holder in step, including on the clearing paths (lock, wipe, 401).
+function setSessionToken(tok) {
+  sessionToken = tok || null;
+  try { window.AndroidShell?.setSessionToken?.(sessionToken || ""); } catch (_) {}
+}
 let myName = "";
 let myMailbox = "";
 let myBackupBytes = 0; // group-image backup budget in bytes (0 = off)
+// myMediaAutoSave is the GLOBAL default for copying received photos into the
+// phone's gallery. A per-contact override (contact.media_auto_save) wins over
+// it; see effectiveMediaAutoSave. Mirrors Profile.MediaAutoSave on the backend.
+let myMediaAutoSave = false;
 let myAvatarHash = ""; // sha256 of my own avatar image (""=none); rendered via /api/avatar
 let contacts = [];   // [{account, name, status}]
 let requests = [];   // [{account, name}]
@@ -23,13 +43,15 @@ let torSendable = false;   // outbound circuits are up — we can dial peers to 
 let torConnectingSince = 0; // wall-clock ms we entered a not-yet-sendable state; 0 = sendable/disabled
 let torBootstrapFrac = 0;  // 0.0–1.0 from the backend
 let torHsState = "";       // "bootstrapping"|"publishing"|"running"|"unknown"|""
+let torServiceState = "";  // what the onion service itself reports: "bootstrapping"|"degraded-unreachable"|"running"|"recovering"|... ; "" where the backend can't ask
+let torPublishSince = 0;   // wall-clock ms we became send-only (sendable, not yet reachable); 0 = not in that window
 const TOR_STALLED_MS = 45000; // connecting longer than this => "still connecting, check your network"
 let torStallHint = "";     // last Arti log line, fetched on first stall detection
 let appVersionInfo = null;  // cached /api/version (build metadata for the diagnostics snapshot)
 let deviceRoleText = "";    // "primary"|"secondary" cached from loadDevices, for diagnostics
 let lookupResult = null;
 let currentTab = "chats";
-let detailContent = null; // null | "chat" | "add" | "info" | "group-info"
+let detailContent = null; // null | "chat" | "add" | "group-info"
 let currentAddMode = "person"; // "person" | "group" — tracks the add-screen toggle
 let prevRequestCount = 0;
 let prevGroupInviteCount = 0;
@@ -277,14 +299,30 @@ function initTheme() {
 }
 
 // ---------- api ----------
+// Every call carries a timeout (Tor lookups can legitimately take ~80s cold;
+// anything beyond that gets an AbortError the caller can surface as "still
+// working / try again" instead of a button stuck on "Looking up…" forever).
+const API_TIMEOUT_MS = 95000;
 async function api(path, options = {}) {
   const headers = Object.assign({ "Content-Type": "application/json" }, options.headers || {});
   if (controlToken) headers["X-Control-Token"] = controlToken;
   if (sessionToken) headers["Authorization"] = "Bearer " + sessionToken;
-  const res = await fetch(path, Object.assign({}, options, { headers }));
-  let body = {};
-  try { body = await res.json(); } catch (_) {}
-  return { ok: res.ok, status: res.status, body };
+  const timeoutMs = options.timeoutMs || API_TIMEOUT_MS;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(path, Object.assign({}, options, { headers, signal: ctrl.signal }));
+    let body = {};
+    try { body = await res.json(); } catch (_) {}
+    return { ok: res.ok, status: res.status, body };
+  } catch (e) {
+    if (e && e.name === "AbortError") {
+      return { ok: false, status: 0, body: { error: "The network is very slow — try again?" }, timedOut: true };
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // ---------- confirm dialog ----------
@@ -294,6 +332,7 @@ async function api(path, options = {}) {
 // danger:true to paint the confirm button in the error colour for destructive
 // actions. Resolves true on confirm, false on cancel / backdrop / Escape.
 let confirmResolver = null;
+let confirmReturnFocus = null;
 function confirmDialog({ title, message, confirmLabel = "Confirm", cancelLabel = "Cancel", danger = false }) {
   const modal = $("confirm-modal");
   $("confirm-title").textContent = title;
@@ -305,12 +344,19 @@ function confirmDialog({ title, message, confirmLabel = "Confirm", cancelLabel =
   cancel.hidden = !cancelLabel;
   cancel.textContent = cancelLabel || "";
   ok.classList.toggle("danger-fill", danger);
+  // Non-danger confirms must not wear error tones — the class (not a permanent
+  // inline style) is the single source of the button's colour.
   modal.hidden = false;
-  setTimeout(() => cancel.focus(), 0);
+  confirmReturnFocus = document.activeElement;
+  setTimeout(() => (cancel.hidden ? ok : cancel).focus(), 0);
   return new Promise((resolve) => {
     confirmResolver = (result) => {
       modal.hidden = true;
       confirmResolver = null;
+      if (confirmReturnFocus && confirmReturnFocus.focus) {
+        try { confirmReturnFocus.focus(); } catch (_) {}
+      }
+      confirmReturnFocus = null;
       resolve(result);
     };
   });
@@ -331,7 +377,8 @@ $("confirm-modal").addEventListener("keydown", (e) => {
 //   values     — pre-filled values (for editing existing data)
 //   passwordFirst — if true, prepends a password field (for PIN setup, etc.)
 let editDialogResolver = null;
-function editDialog({ title, fields = [], values = {}, passwordFirst = false }) {
+let editDialogReturnFocus = null;
+function editDialog({ title, fields = [], values = {}, passwordFirst = false, confirmLabel = "Save", errorMessage = "" }) {
   $("edit-dialog-title").textContent = title;
   const wrap = $("edit-dialog-fields");
   wrap.innerHTML = "";
@@ -357,12 +404,19 @@ function editDialog({ title, fields = [], values = {}, passwordFirst = false }) 
     wrap.append(el);
     inputs[f.id] = el;
   }
-  // Error placeholder
+  // Error element — static text (never an editable field). Callers pass
+  // errorMessage to reopen the dialog with a failure reason while keeping the
+  // user's context, instead of closing and re-opening as a fake text input.
   const errEl = document.createElement("p");
-  errEl.className = "label error"; errEl.hidden = true;
+  errEl.className = "label error";
+  errEl.setAttribute("role", "alert");
+  errEl.textContent = errorMessage || "";
+  errEl.hidden = !errorMessage;
   wrap.append(errEl);
+  $("edit-dialog-save").textContent = confirmLabel;
   $("edit-dialog").hidden = false;
   $("bottomnav").hidden = true;
+  editDialogReturnFocus = document.activeElement;
   // Focus first field
   setTimeout(() => { const first = wrap.querySelector("md-outlined-text-field"); if (first) first.focus(); }, 50);
   return new Promise((resolve) => {
@@ -372,6 +426,10 @@ function editDialog({ title, fields = [], values = {}, passwordFirst = false }) 
       const isWideD = window.matchMedia("(min-width: 900px)").matches;
       $("bottomnav").hidden = detailContent !== null && !isWideD;
       editDialogResolver = null;
+      if (editDialogReturnFocus && editDialogReturnFocus.focus) {
+        try { editDialogReturnFocus.focus(); } catch (_) {}
+      }
+      editDialogReturnFocus = null;
       if (result === false) { resolve(null); return; }
       // Collect values
       const out = {};
@@ -394,6 +452,24 @@ $("edit-dialog").addEventListener("keydown", (e) => {
 function infoDialog(title, message) {
   return confirmDialog({ title, message, confirmLabel: "Got it", cancelLabel: "" });
 }
+// Shared Tab trap for the hand-rolled modals (Material Web's md-dialog would
+// give this for free; for the div-dialogs we wire it once). Cycles focus
+// within the card so keyboard/switch users can't tab into the page behind.
+function trapModalFocus(card, e) {
+  if (e.key !== "Tab") return;
+  const nodes = [...card.querySelectorAll(
+    'button:not([disabled]), [href], input:not([disabled]), select, textarea, md-text-button, md-filled-button, md-filled-tonal-button, md-outlined-button, md-outlined-text-field, md-filled-text-field'
+  )].filter((el) => !el.hidden && el.offsetParent !== null);
+  if (!nodes.length) return;
+  const first = nodes[0], last = nodes[nodes.length - 1];
+  if (e.shiftKey && (document.activeElement === first || document.activeElement === card)) {
+    e.preventDefault(); last.focus();
+  } else if (!e.shiftKey && document.activeElement === last) {
+    e.preventDefault(); first.focus();
+  }
+}
+$("confirm-modal")?.querySelector(".modal-card")?.addEventListener("keydown", (e) => trapModalFocus(e.currentTarget, e));
+$("edit-dialog")?.querySelector(".modal-card")?.addEventListener("keydown", (e) => trapModalFocus(e.currentTarget, e));
 // Subtle haptic tick where the platform has a vibrator; a silent no-op on
 // desktop and in the headless harness. Guarded exactly like the long-press site.
 function haptic(ms = 10) {
@@ -401,9 +477,25 @@ function haptic(ms = 10) {
 }
 
 const shortAccount = (a) => (a.length > 18 ? a.slice(0, 8) + "…" + a.slice(-6) : a);
+// contactLabel is the ONE rule for how a contact is named anywhere in the UI: the
+// user's private nickname wins over the name the peer publishes for themselves,
+// which in turn beats a shortened account number. Every surface showing a human
+// name must come through here — read `.name` directly and that surface silently
+// ignores the nickname, which is worse than not having the feature (a chat list
+// and a notification disagreeing about who is messaging you). The Go side holds
+// the same rule in contactDisplayNameLocked() for the labels it produces, since
+// system notifications and group-author names never pass through this file.
+function contactLabel(c, fallback) {
+  if (!c) return fallback || "";
+  // Rows that reach us from the server without a nickname field (a relay holder, a
+  // group roster entry) are still resolved against the live contact list, so the
+  // nickname applies to them too.
+  const live = c.account ? contacts.find((x) => x.account === c.account) : null;
+  return c.nickname || (live && live.nickname) || c.name || (live && live.name) ||
+    fallback || (c.account ? shortAccount(c.account) : "");
+}
 function contactName(account) {
-  const c = contacts.find((c) => c.account === account);
-  return c && c.name ? c.name : shortAccount(account);
+  return contactLabel(contacts.find((c) => c.account === account), shortAccount(account));
 }
 function fmtTime(at) {
   const d = new Date(at);
@@ -459,7 +551,17 @@ function show(name) {
 }
 
 async function refresh() {
-  const { ok, status, body } = await api("/api/status");
+  let res;
+  try {
+    res = await api("/api/status");
+  } catch (_) {
+    // fetch() rejects only on a network-level failure (backend down or gone).
+    // Without this the boot screen spun "Loading…" forever with no way out.
+    if (!$("loading").hidden) return showLoadingError("Couldn't reach the Molepipe backend.");
+    showToast("Couldn't reach the Molepipe backend.");
+    return;
+  }
+  const { ok, status, body } = res;
   // A 403 here means the control listener rejected us: our capability token is
   // missing or stale (e.g. a browser tab reopened from history after the token
   // was scrubbed, or the backend restarted with a fresh token). No API call can
@@ -473,14 +575,26 @@ async function refresh() {
   showLockScreen();
 }
 
+// showLoadingError parks the boot screen on a plain failure message with a
+// Retry button. Without it, anything that stopped the boot chain left the page
+// on the silent infinite "Loading…" placeholder — indistinguishable from a
+// broken script, with nothing to try.
+function showLoadingError(message) {
+  const msg = $("loading-msg");
+  if (msg) msg.textContent = message;
+  const retry = $("loading-retry");
+  if (retry) retry.hidden = false;
+  show("loading");
+}
+
 // showControlTokenError parks the app on a clear "reopen me from the app"
 // message. Used when we boot without a usable control token (see refresh).
+// No Retry: a spent or missing token can only be fixed by relaunching.
 function showControlTokenError() {
-  const el = $("loading");
-  if (el) {
-    el.textContent =
-      "This page must be opened from the Molepipe app. Please relaunch the app to continue.";
-  }
+  const msg = $("loading-msg");
+  if (msg) msg.textContent = "This page must be opened from the Molepipe app. Please relaunch the app to continue.";
+  const retry = $("loading-retry");
+  if (retry) retry.hidden = true;
   show("loading");
 }
 
@@ -539,7 +653,7 @@ function renderPinKeypad() {
   backBtn.className = "keypad-btn keypad-btn-action";
   backBtn.dataset.action = "back";
   backBtn.setAttribute("aria-label", "Backspace");
-  backBtn.innerHTML = '<svg class="icon"><use href="#ic-back"/></svg>';
+  backBtn.innerHTML = '<svg class="icon"><use href="#ic-backspace"/></svg>';
   grid.appendChild(backBtn);
 
   const lastNumBtn = document.createElement("button");
@@ -565,6 +679,7 @@ function showPinEntry(usePin) {
   const sub = $("lock-subtitle");
   if (sub) sub.textContent = usePin ? "Enter your PIN to unlock" : "Enter your password to unlock";
   $("pin-error").hidden = true;
+  const pinLeft = $("pin-attempts"); if (pinLeft) pinLeft.hidden = true;
   $("unlock-error").hidden = true;
   $("pin").value = "";
   $("password").value = "";
@@ -582,55 +697,94 @@ function showPinEntry(usePin) {
   }
 }
 
-// Render an onion address with its first and last 4 base32 chars emphasized and
-// the middle dimmed. Onion addresses are opaque high-entropy strings with no
-// internal field structure, so we don't chunk them — the only check people do is
-// comparing the leading/trailing chars against a known-good copy, and emphasis
-// points the eye straight at those. The raw address is stashed in dataset.full;
-// the Copy handler reads ONLY that, so this visual markup can't corrupt the copy.
-function renderOnionAddress(el, full) {
+// Render a shareable friend code with the parts people actually verify picked out.
+//
+// A friend code is either a bare 56-char base32 account number or the versioned
+// "mp1:<account>:<token>" form (protocol.EncodeInviteCode). Neither carries a
+// ".onion" suffix — AccountNumber() is the bare base32; only OnionAddress()
+// appends the TLD.
+//
+// The head/tail emphasis exists for one job: the only check anyone performs on
+// an opaque high-entropy string is comparing its first and last few chars
+// against a known-good copy, so the eye is pointed straight at those. That has
+// to emphasize the ACCOUNT's endpoints — the account is the durable identity.
+// Emphasizing the endpoints of the whole code instead picks out the constant
+// "mp1:" prefix (identical for every user, so it verifies nothing) and the tail
+// of the one-time token (rotates on every refresh, so it verifies nothing
+// either), while burying the account's real endpoints in the dimmed middle.
+//
+// The account is chunked into groups of 4 (the Signal-safety-number treatment)
+// so the eye can track position while comparing, and the first and last GROUP
+// carry the emphasis — same job as before, now aligned to the chunk boundaries.
+//
+// The token is dimmed as a trailing field rather than chunked: it is ephemeral
+// and nobody compares it. The raw code is stashed in dataset.full; the Copy and
+// QR handlers read ONLY that, so this visual markup can't corrupt what ships.
+function renderFriendCode(el, full) {
   el.dataset.full = full;
   el.textContent = "";
-  const dot = full.toLowerCase().lastIndexOf(".onion");
-  const body = dot >= 0 ? full.slice(0, dot) : full;
-  const tld = dot >= 0 ? full.slice(dot) : "";
   const add = (text, cls) => {
     if (!text) return;
     const s = document.createElement("span");
     s.className = cls; s.textContent = text; el.appendChild(s);
   };
-  if (body.length > 8) {
-    add(body.slice(0, 4), "addr-hi");
-    add(body.slice(4, -4), "addr-mid");
-    add(body.slice(-4), "addr-hi");
-  } else {
-    add(body, "addr-hi");
+  // Split on the real delimiters. Account numbers and the base64url token
+  // alphabet contain no ':', so the colon is unambiguous (see
+  // protocol.ParseInviteCode, which splits the same way).
+  let account = full, prefix = "", token = "";
+  const parts = full.split(":");
+  if (parts.length === 3 && parts[0]) {
+    [prefix, account, token] = parts;
   }
-  add(tld, "addr-tld");
+  add(prefix && prefix + ":", "addr-scheme");
+  // Chunk the account into groups of 4. The groups are separate elements with
+  // no separator CHARACTER between them — the gap is flex spacing in CSS — so
+  // concatenating the spans still reproduces the code byte for byte, and a
+  // manual text selection doesn't pick up spaces that aren't in the real code.
+  // Wrapping then happens at group boundaries instead of mid-group.
+  const groups = account.match(/.{1,4}/g) || [];
+  groups.forEach((g, i) => {
+    const edge = groups.length > 2 && (i === 0 || i === groups.length - 1);
+    add(g, "addr-grp " + (edge ? "addr-hi" : "addr-mid"));
+  });
+  add(token && ":" + token, "addr-token");
 }
 
 async function showUnlocked() {
   const { ok, body } = await api("/api/identity");
-  if (!ok) { sessionToken = null; return show("locked"); }
-  renderOnionAddress($("account"), body.account_number);
+  if (!ok) { setSessionToken(null); return show("locked"); }
+  // #account now shows the shareable friend code (loaded by loadInviteCode), not
+  // the raw account number — the account alone is no longer addable.
   selfAccount = body.account_number;
   updateTor(body);
   show("unlocked");
   setTab("chats");
-  await Promise.all([loadProfile(), loadContacts(), loadGroups(), loadRequests(), loadGroupInvites(), loadMessages(), loadDesktop()]);
+  await Promise.all([loadProfile(), loadContacts(), loadGroups(), loadRequests(), loadGroupInvites(), loadMessages(), loadDesktop(), loadInviteCode()]);
   poll();
+  // Only now — with a session, and the contact list loaded — collect anything
+  // shared into us from another app. See consumeSharedImage.
+  consumeSharedImage();
 }
 
 // ---------- navigation ----------
-// showDetail controls the detail pane (chat / add / contact-info / placeholder).
+// showDetail controls the detail pane (chat / add / group-info / placeholder).
 // On mobile the detail pane overlays the sidebar; on desktop it's the right pane.
 function showDetail(kind) {
   detailContent = kind;
+  // Wide layout: with the You/Requests tabs active and no chat open, render
+  // full-width instead of squeezing settings into the master column beside a
+  // stale "Select a conversation" placeholder (which sat pixel-identical across
+  // every settings screen in the landscape audit). The Chats tab keeps the
+  // placeholder — there the detail pane is a legitimate chat picker.
+  if ($("shell")) {
+    const wideSolo = window.matchMedia("(min-width: 900px)").matches && kind === null && currentTab !== "chats";
+    $("shell").classList.toggle("wide-solo", wideSolo);
+  }
   $("detail-placeholder").hidden = kind !== null;
   $("chat-screen").hidden = kind !== "chat";
   $("add-screen").hidden = kind !== "add";
-  $("contact-info").hidden = kind !== "info";
   $("group-info").hidden = kind !== "group-info";
+  $("contact-info").hidden = kind !== "contact-info";
   $("chat-menu").hidden = true;
   $("group-menu").hidden = true;
   // The overflow menu is a contact menu for a 1:1 chat and a group menu for a
@@ -638,6 +792,9 @@ function showDetail(kind) {
   $("chat-menu-btn").hidden = kind !== "chat";
   $("back-btn").hidden = kind === null;
   $("shell").classList.toggle("detail-open", kind !== null);
+  // Marks the header as a control: in a 1:1 chat the name/avatar opens the
+  // friend profile (see ciHeaderTap), so the cursor must say so.
+  $("shell").classList.toggle("chat-contact", kind === "chat" && chatKind === "contact");
   // Hide bottom nav when a detail pane overlays the sidebar (mobile only;
   // on desktop the two panes sit side-by-side and bottomnav is always visible).
   const isWide = window.matchMedia("(min-width: 900px)").matches;
@@ -645,8 +802,8 @@ function showDetail(kind) {
   $("detail-title").textContent =
     kind === "chat" ? (chatKind === "group" ? groupName(currentGroup) : contactName(currentPeer)) :
     kind === "add" ? (currentAddMode === "group" ? "New group" : "Message someone") :
-    kind === "info" ? "Account number" :
-    kind === "group-info" ? "Group info" : "";
+    kind === "group-info" ? "Group info" :
+    kind === "contact-info" ? contactName(currentPeer) : "";
   // Chat header avatar: only for a 1:1 contact chat (groups keep their icon badge
   // in the list; the header just shows the name). Renders from the local cache.
   const da = $("detail-avatar");
@@ -671,13 +828,15 @@ function setTab(tab) {
   // the selected tab. Only an open chat is preserved; other panes reset.
   const wide = window.matchMedia("(min-width: 900px)").matches;
   if (!(wide && detailContent === "chat")) { leaveChatRead(); showDetail(null); }
-  $("fab-add").hidden = tab !== "chats";
+  // FAB shows on Chats only, and only when the empty state isn't already
+  // offering the same actions.
+  $("fab-add").hidden = tab !== "chats" || !$("no-contacts").hidden;
   $("search-btn").hidden = tab !== "chats";
   if ($("header-gap")) $("header-gap").hidden = tab !== "chats";
   $("sidebar-title").textContent = TABS[tab];
   for (const t of ["chats", "requests", "you"]) $("tab-" + t).hidden = t !== tab;
   document.querySelectorAll(".navitem").forEach((n) => n.classList.toggle("active", n.dataset.tab === tab));
-  if (tab === "you") { showYouPane(youPane); loadDevices(); loadPinState(); loadWipeState(); }
+  if (tab === "you") { showYouPane(youPane); loadDevices(); loadPinState(); loadWipeState(); loadInviteCode(); }
 }
 // You-tab sub-navigation: show one pane's wrappers, hide the rest. Toggles a
 // class (not `hidden`), so cards keep their own hidden state within a pane.
@@ -686,7 +845,11 @@ function setTab(tab) {
 let youPane = "profile";
 function showYouPane(pane) {
   youPane = pane;
-  document.querySelectorAll("#tab-you .you-tab").forEach((t) => t.classList.toggle("active", t.dataset.pane === pane));
+  document.querySelectorAll("#tab-you .you-tab").forEach((t) => {
+    const on = t.dataset.pane === pane;
+    t.classList.toggle("active", on);
+    t.setAttribute("aria-selected", on ? "true" : "false");
+  });
   document.querySelectorAll("#tab-you [data-you-pane]").forEach((el) => el.classList.toggle("pane-on", el.dataset.youPane === pane));
 }
 document.querySelectorAll("#tab-you .you-tabs .you-tab").forEach((t) => t.addEventListener("click", () => showYouPane(t.dataset.pane)));
@@ -815,13 +978,10 @@ async function loadGroupMembers() {
   groupInfoCtx = { my_role: body.my_role, i_can_invite: body.i_can_invite, policy: body.policy, name: body.name };
   renderGroupInfo();
 }
-function openContactInfo() {
-  $("contact-info-account").textContent = currentPeer;
-  showDetail("info");
-}
 function backAction() {
-  // Info / group-info are sub-screens of an open chat: back returns to it.
-  if (detailContent === "info" || detailContent === "group-info") { showDetail("chat"); return; }
+  // Group-info is a sub-screen of an open chat: back returns to it.
+  if (detailContent === "group-info") { showDetail("chat"); return; }
+  if (detailContent === "contact-info") { showDetail("chat"); return; }
   leaveChatRead(); // final read before we drop the chat, so it can't re-badge (item 4)
   currentPeer = null;
   currentGroup = null;
@@ -830,6 +990,14 @@ function backAction() {
 }
 
 // ---------- data ----------
+// " (2m)" once the send-only window has lasted long enough to be worth saying.
+// Below a minute the number would just be noise — publishing that fast is the
+// normal case and needs no explanation.
+function publishElapsedSuffix() {
+  if (torPublishSince === 0) return "";
+  const mins = Math.floor((Date.now() - torPublishSince) / 60000);
+  return mins >= 1 ? " (" + mins + "m)" : "";
+}
 function updateTor(body) {
   torReady = !!(body.tor_enabled && body.tor_ready);
   // Older backends don't report tor_sendable; fall back to tor_ready so the
@@ -839,6 +1007,16 @@ function updateTor(body) {
   torSendable = !!(body.tor_enabled && (body.tor_sendable ?? body.tor_ready));
   torBootstrapFrac = body.tor_bootstrap_frac ?? 0;
   torHsState = body.tor_hs_state ?? "";
+  torServiceState = body.tor_service_state ?? "";
+  // Clock for the send-only window, kept the same way as torConnectingSince:
+  // wall clock, because a backgrounded webview freezes timers and would
+  // under-count. Starts when we first become sendable-but-not-reachable and
+  // clears the moment either side of that changes.
+  if (torSendable && !torReady) {
+    if (torPublishSince === 0) torPublishSince = Date.now();
+  } else {
+    torPublishSince = 0;
+  }
   // Track HOW LONG we've been connecting by wall clock (Date.now), not a poll
   // count: a backgrounded webview freezes timers and would under-count. Start the
   // clock when we ENTER a connecting state — on a fresh load already connecting
@@ -855,10 +1033,12 @@ function updateTor(body) {
   const el = $("tor-status");
   if (el) {
     if (!body.tor_enabled) el.textContent = "Onion service: disabled";
-    else if (body.tor_ready) el.textContent = "Onion service: online \u2014 reachable over Tor \u2713";
-    // Bootstrapped enough to send, but our address isn't on the network yet:
-    // you can message people now; their replies land once publishing finishes.
-    else if (torSendable) el.textContent = "Onion service: publishing your address\u2026 you can send now; replies arrive once it's online";
+    else if (body.tor_ready) el.textContent = "Onion service: online \u2014 send \u2713 receive \u2713";
+    // Bootstrapped enough to send, but our address isn't on the network yet. The
+    // header pill only has room for two words per direction; this is where the
+    // whole story goes, elapsed time included, because "publishing\u2026" with no
+    // number is what makes a slow publish feel broken rather than slow.
+    else if (torSendable) el.textContent = "Onion service: send \u2713 receive \u2014 publishing your address" + publishElapsedSuffix() + "; you can message people now, their replies arrive once it's published";
     // Still no outbound circuits. Distinguish "just started" from "stuck" by
     // elapsed wall-clock time — honestly time-derived, not a real progress %,
     // since the backend exposes only two booleans (no bootstrap percentage).
@@ -883,13 +1063,18 @@ function updateTor(body) {
   // --- tor pill (sidebar header) ---
   const pill = $("tor-pill");
   if (pill) {
-    let state, label;
+    let state, label, split = false;
     if (!body.tor_enabled) {
       state = "offline"; label = "Offline";
     } else if (torHsState === "running") {
       state = "online"; label = "Online";
     } else if (torHsState === "publishing") {
-      state = "connecting"; label = "Publishing\u2026";
+      // The one state where the two directions disagree: we can send, nobody can
+      // reach us yet. Show both legs rather than picking a word that misreports
+      // one of them — "Online" would claim reachability we don't have, and
+      // "Publishing\u2026" hides that sending already works. Collapses back to a
+      // single "Online" above, as soon as both agree.
+      state = "connecting"; split = true;
     } else if (torHsState === "bootstrapping") {
       state = "connecting";
       // Descriptive labels based on bootstrap fraction ranges
@@ -912,9 +1097,43 @@ function updateTor(body) {
     } else {
       state = "connecting"; label = "Connecting\u2026";
     }
-    pill.className = "tor-pill " + state;
+    pill.className = "tor-pill " + state + (split ? " split" : "");
+    // Exactly one of the two renderings is live at a time: single icon + word, or
+    // the two direction legs.
+    const iconEl = pill.querySelector(".pill-icon");
     const labelEl = pill.querySelector(".pill-label");
-    if (labelEl) labelEl.textContent = label;
+    const splitEl = pill.querySelector(".pill-split");
+    if (iconEl) iconEl.hidden = split;
+    if (labelEl) {
+      labelEl.hidden = split;
+      if (!split) labelEl.textContent = label;
+    }
+    if (splitEl) {
+      splitEl.hidden = !split;
+      if (split) {
+        const legs = splitEl.querySelectorAll(".pill-leg");
+        if (legs.length === 2) {
+          legs[0].classList.remove("waiting");
+          legs[1].classList.add("waiting");
+          // Deliberately no elapsed count on the leg itself. The six minutes
+          // this window lasts on hardware is mostly arti waiting out HsDirs
+          // that never answer, and the service is very likely reachable well
+          // before the status flips — so a prominent ticking "Receive 5m"
+          // would be shouting about a wait that is partly fictional. The
+          // number stays on the hover title and the You tab, where it reads
+          // as "how long we have been in this state" rather than a promise.
+          legs[0].setAttribute("aria-label", "Sending: ready");
+          // The service's own word for what it is doing, where we have it:
+          // "recovering" or "degraded-unreachable" after a failed upload reads
+          // very differently from a first publish still in progress.
+          const detail = torServiceState && torServiceState !== "unknown" ? " (" + torServiceState + ")" : "";
+          legs[1].setAttribute("aria-label", "Receiving: publishing your address" + publishElapsedSuffix() + detail);
+        }
+      }
+    }
+    pill.title = split
+      ? "You can send now. Your address is still publishing" + publishElapsedSuffix() + ", so people can't reach you yet."
+      : "";
     // Progress bar: set width from bootstrap fraction for determinate states
     const barFill = pill.querySelector(".pill-bar-fill");
     if (barFill) {
@@ -944,23 +1163,117 @@ function reflectSendState() {
 }
 
 let pollTimer = null;
+// refreshAll pulls one full snapshot of everything on screen. Both the 2.5s
+// poll and the manual refresh (pull-down / desktop button) go through here, so
+// a manual refresh is exactly a tick that happened early. Returns false when
+// the session is gone, which tells the caller not to keep polling.
+async function refreshAll() {
+  if (!sessionToken) return false;
+  const { ok, status, body } = await api("/api/identity");
+  // The session can be ended from outside this page: another tab locking, or
+  // the desktop build's tray "Lock". Left unhandled, polling would stop and
+  // the window would keep showing a conversation list for an account that is
+  // locked and offline — so fall back to the lock screen when the token dies.
+  if (status === 401) { setSessionToken(null); showLockScreen(); return false; }
+  if (!ok) return false;
+  updateTor(body);
+  await Promise.all([loadProfile(), loadContacts(), loadGroups(), loadRequests(), loadGroupInvites(), loadMessages(), loadDesktop()]);
+  // Keep the displayed friend code fresh while the user is looking at it: under
+  // auto-refresh a redemption rotates the token server-side, so a stale code on
+  // screen would otherwise be shared and rejected. Only while the profile pane is
+  // actually visible, to avoid regenerating a QR every tick.
+  if (currentTab === "you" && youPane === "profile") loadInviteCode();
+  reconcileOpenChatRead(); // after all loads, so contacts/groups are the fresh server copy
+  return true;
+}
 function poll() {
   clearTimeout(pollTimer);
   pollTimer = setTimeout(async () => {
-    if (!sessionToken) return;
-    const { ok, status, body } = await api("/api/identity");
-    // The session can be ended from outside this page: another tab locking, or
-    // the desktop build's tray "Lock". Left unhandled, polling would stop and
-    // the window would keep showing a conversation list for an account that is
-    // locked and offline — so fall back to the lock screen when the token dies.
-    if (status === 401) { sessionToken = null; return showLockScreen(); }
-    if (!ok) return;
-    updateTor(body);
-    await Promise.all([loadProfile(), loadContacts(), loadGroups(), loadRequests(), loadGroupInvites(), loadMessages(), loadDesktop()]);
-    reconcileOpenChatRead(); // after all loads, so contacts/groups are the fresh server copy
+    if (!(await refreshAll())) return;
     poll();
   }, 2500);
 }
+
+// ---- manual refresh (pull-down on touch, button on desktop) ----
+// The poll already reloads everything every 2.5s, so this is not about getting
+// data sooner — it is the gesture people reach for when something looks stuck
+// (a request that still says "Requested", a message that hasn't arrived). It
+// also kicks the backend's own fetches: /api/identity and /api/messages are
+// what drive a mailbox sweep, so an early tick is a real retry, not just a
+// repaint. Shown for at least a moment so the pull visibly did something.
+let refreshing = false;
+const PTR_SPIN_MIN_MS = 500;
+async function manualRefresh() {
+  if (refreshing || !sessionToken) return;
+  refreshing = true;
+  setPtr(56, true, true);
+  const btn = $("refresh-btn");
+  if (btn) { btn.disabled = true; btn.classList.add("spinning"); }
+  const started = Date.now();
+  try {
+    await refreshAll();
+  } finally {
+    const left = PTR_SPIN_MIN_MS - (Date.now() - started);
+    if (left > 0) await new Promise((r) => setTimeout(r, left));
+    refreshing = false;
+    setPtr(0, false, false);
+    if (btn) { btn.disabled = false; btn.classList.remove("spinning"); }
+    poll(); // restart the cadence from now, so the next tick is a full interval away
+  }
+}
+
+// setPtr places the pull-to-refresh indicator. `dist` is how far down it has
+// been dragged (0 parks it back above the top edge), `armed` highlights it once
+// the release threshold is passed, `spin` runs it while the refresh is in
+// flight. `settling` turns the CSS transition on for anything that is not a
+// finger-driven move, so the snap back is animated but the drag is not.
+function setPtr(dist, armed, spin) {
+  const el = $("ptr");
+  if (!el) return;
+  const dragging = dist > 0 && !spin;
+  el.classList.toggle("settling", !dragging);
+  el.classList.toggle("armed", !!armed);
+  el.classList.toggle("spinning", !!spin);
+  el.style.transform = dist > 0 ? `translateY(${dist - 44}px)` : "translateY(-44px)";
+  el.style.opacity = dist > 0 ? String(Math.min(1, dist / 48)) : "0";
+}
+
+// enablePullToRefresh wires the gesture on one scrollable tab. Only starts when
+// the list is already scrolled to the top, so it never fights a normal scroll.
+function enablePullToRefresh(scroller) {
+  if (!scroller) return;
+  const TRIGGER = 64, MAX = 96, DAMP = 0.5;
+  let startY = 0, pulling = false, dist = 0;
+  scroller.addEventListener("touchstart", (e) => {
+    if (refreshing || e.touches.length !== 1 || scroller.scrollTop > 0) { pulling = false; return; }
+    startY = e.touches[0].clientY; pulling = true; dist = 0;
+  }, { passive: true });
+  scroller.addEventListener("touchmove", (e) => {
+    if (!pulling) return;
+    const dy = e.touches[0].clientY - startY;
+    // Finger went up, or the list scrolled under us: this is a scroll, not a pull.
+    if (dy <= 0 || scroller.scrollTop > 0) {
+      pulling = false;
+      if (dist > 0) { dist = 0; setPtr(0, false, false); }
+      return;
+    }
+    dist = Math.min(dy * DAMP, MAX);
+    setPtr(dist, dist >= TRIGGER, false);
+    if (e.cancelable) e.preventDefault(); // we own this gesture now
+  }, { passive: false });
+  const release = () => {
+    if (!pulling) return;
+    pulling = false;
+    const fire = dist >= TRIGGER;
+    dist = 0;
+    if (fire) manualRefresh(); else setPtr(0, false, false);
+  };
+  scroller.addEventListener("touchend", release);
+  scroller.addEventListener("touchcancel", release);
+}
+enablePullToRefresh($("tab-chats"));
+enablePullToRefresh($("tab-requests"));
+$("refresh-btn").addEventListener("click", manualRefresh);
 
 async function loadProfile() {
   const { ok, body } = await api("/api/profile");
@@ -973,47 +1286,247 @@ async function loadProfile() {
   const ms = $("mailbox-state");
   if (ms) ms.textContent = myMailbox ? myMailbox : "Not set — messages only arrive when you're online";
   myBackupBytes = body.group_image_backup_bytes || 0;
+  myMediaAutoSave = !!body.media_auto_save;
   renderBackupState();
+  syncMediaSaveSection();
 }
 
 // renderMyAvatar paints the settings avatar from my own hash (cache-busted so a
 // just-changed picture updates immediately rather than showing the cached image
 // at the old hash — the hash IS the version, so a new hash is a new URL anyway,
-// but this also refreshes after a Remove+re-add to the same bytes) and shows the
-// Remove button only when a picture is set.
+// but this also refreshes after a Remove+re-add to the same bytes).
+//
+// It also retargets the button, which does two different things: with no picture
+// set it opens the file picker (badge: pencil, "Add"), and with one set it opens
+// the picture fullscreen (badge: magnifier, "View"), where Edit and Remove live.
+// Remove used to sit beside the avatar as its own button; it moved into the
+// viewer so the picture itself is the only control on this row.
 function renderMyAvatar() {
   const box = $("my-avatar");
   if (box) { box.innerHTML = ""; box.append(avatarNode(myAvatarHash, myName, null)); }
-  const rm = $("avatar-remove-btn");
-  if (rm) rm.hidden = !myAvatarHash;
+  const badge = $("avatar-badge-icon");
+  if (badge) badge.setAttribute("href", myAvatarHash ? "#ic-zoom-in" : "#ic-edit");
+  const btn = $("avatar-btn");
+  if (btn) btn.setAttribute("aria-label", myAvatarHash ? "View profile picture" : "Add a profile picture");
 }
 
 // AVATAR_CAP_BYTES mirrors the backend's protocol.MaxAvatarBytes (64 KiB). The
 // crop below almost always lands well under it; the loop drops quality if not.
 const AVATAR_CAP_BYTES = 64 * 1024;
 
-// processAvatar center-crops the chosen image to a square and downscales it to a
-// small JPEG under the cap. All image work happens here in the client — the Go
+// encodeAvatar turns the cropped canvas into a small JPEG under the cap, backing
+// quality off until it fits. All image work happens here in the client — the Go
 // backend never decodes images (it's gomobile-portable), it only validates the
 // type and size and stores the bytes.
-async function processAvatar(file) {
-  let bitmap;
-  try { bitmap = await createImageBitmap(file); }
-  catch (_) { throw new Error("Couldn't read that image."); }
-  try {
-    const side = Math.min(bitmap.width, bitmap.height);
-    const sx = (bitmap.width - side) / 2, sy = (bitmap.height - side) / 2;
-    const dim = Math.min(256, side); // 256px square is plenty for an avatar
-    const canvas = document.createElement("canvas");
-    canvas.width = dim; canvas.height = dim;
-    canvas.getContext("2d").drawImage(bitmap, sx, sy, side, side, 0, 0, dim, dim);
-    const toBlob = (q) => new Promise((res) => canvas.toBlob(res, "image/jpeg", q));
-    let q = 0.85, blob = await toBlob(q);
-    while (blob && blob.size > AVATAR_CAP_BYTES && q > 0.3) { q -= 0.15; blob = await toBlob(q); }
-    if (!blob || blob.size > AVATAR_CAP_BYTES) throw new Error("That image is too large, even compressed.");
-    return blob;
-  } finally { if (bitmap.close) bitmap.close(); }
+async function encodeAvatar(canvas) {
+  const toBlob = (q) => new Promise((res) => canvas.toBlob(res, "image/jpeg", q));
+  let q = 0.85, blob = await toBlob(q);
+  while (blob && blob.size > AVATAR_CAP_BYTES && q > 0.3) { q -= 0.15; blob = await toBlob(q); }
+  if (!blob || blob.size > AVATAR_CAP_BYTES) throw new Error("That image is too large, even compressed.");
+  return blob;
 }
+
+// ---- profile-picture crop editor -------------------------------------------
+// The geometry model, kept deliberately small: `stage` is the side of the square
+// preview, `baseScale` the scale at which the image exactly COVERS it, `zoom`
+// (>= 1) multiplies that, and (tx, ty) is the image's top-left in stage
+// coordinates. avatarCropApply clamps (tx, ty) to the covering range, so the
+// crop can never contain blank space and the save path needs no edge cases.
+//
+// Every measurement and the final draw use the SAME <img> element, never a
+// separate createImageBitmap: an EXIF-rotated photo would otherwise be measured
+// upright and drawn sideways, and the crop would not be what the user framed.
+const AVATAR_ZOOM_MAX = 4;
+const avatarCrop = { stage: 0, natW: 0, natH: 0, baseScale: 1, zoom: 1, tx: 0, ty: 0 };
+let avatarCropResolve = null;  // settles the promise openAvatarCropper returned
+let avatarCropURL = null;      // object URL of the source file; revoked on close
+const avatarCropPointers = new Map();
+let avatarCropPinch = null;    // {dist, zoom, cx, cy} captured when the 2nd finger lands
+let avatarCropDownAt = null;   // where the gesture started (tap vs pan)
+let avatarCropMulti = false;   // was this gesture ever a pinch? (suppresses double-tap)
+let avatarCropLastTap = 0;
+
+function avatarCropApply() {
+  const s = avatarCrop.baseScale * avatarCrop.zoom;
+  const w = avatarCrop.natW * s, h = avatarCrop.natH * s;
+  avatarCrop.tx = Math.min(0, Math.max(avatarCrop.stage - w, avatarCrop.tx));
+  avatarCrop.ty = Math.min(0, Math.max(avatarCrop.stage - h, avatarCrop.ty));
+  $("avatar-crop-img").style.transform =
+    `translate(${avatarCrop.tx}px, ${avatarCrop.ty}px) scale(${s})`;
+}
+// avatarCropZoomTo zooms about a focal point in STAGE coordinates, holding that
+// point still under the finger. Keeping the focal point fixed is the whole trick:
+// zooming about the origin instead would slide the subject out of the circle.
+function avatarCropZoomTo(zoom, fx, fy) {
+  const next = Math.min(AVATAR_ZOOM_MAX, Math.max(1, zoom));
+  const ratio = next / avatarCrop.zoom;
+  avatarCrop.tx = fx - (fx - avatarCrop.tx) * ratio;
+  avatarCrop.ty = fy - (fy - avatarCrop.ty) * ratio;
+  avatarCrop.zoom = next;
+  $("avatar-crop-zoom").value = String(next);
+  avatarCropApply();
+}
+// avatarCropRemeasure re-reads the stage width after a relayout (rotation, a
+// resized window) and rescales the transform to match. Without it `stage` keeps
+// the width it had at open: avatarCropApply would clamp against stale bounds and
+// — worse — avatarCropResult would compute `side` from the old width, so the
+// SAVED crop would differ from the one the circle showed. Scaling tx/ty by the
+// same factor as baseScale leaves both sx = -tx/s and side = stage/s unchanged,
+// so the framing survives the resize exactly.
+function avatarCropRemeasure() {
+  const w = $("avatar-crop-stage").clientWidth;
+  if ($("avatar-crop").hidden || !w || !avatarCrop.natW || w === avatarCrop.stage) return;
+  const k = w / avatarCrop.stage;
+  avatarCrop.tx *= k; avatarCrop.ty *= k;
+  avatarCrop.stage = w;
+  avatarCrop.baseScale = w / Math.min(avatarCrop.natW, avatarCrop.natH);
+  avatarCropApply();
+}
+function avatarCropStagePoint(e) {
+  const r = $("avatar-crop-stage").getBoundingClientRect();
+  return { x: e.clientX - r.left, y: e.clientY - r.top };
+}
+
+// openAvatarCropper shows the editor for a picked file and resolves to the
+// cropped JPEG Blob, or to null if the user cancelled. Callers treat null as
+// "nothing to do" — not an error — so Cancel leaves the old picture alone.
+function openAvatarCropper(file) {
+  return new Promise((resolve) => {
+    avatarCropResolve = resolve;
+    const img = $("avatar-crop-img");
+    const err = $("avatar-crop-error"); err.hidden = true;
+    avatarCropPointers.clear(); avatarCropPinch = null;
+    if (avatarCropURL) URL.revokeObjectURL(avatarCropURL);
+    avatarCropURL = URL.createObjectURL(file);
+    img.onerror = () => { closeAvatarCropper(null); showToast("Couldn't read that image."); };
+    img.onload = () => {
+      // The stage has no width until the modal is visible, which is why the
+      // modal is unhidden BEFORE the src is assigned.
+      avatarCrop.stage = $("avatar-crop-stage").clientWidth || 320;
+      avatarCrop.natW = img.naturalWidth; avatarCrop.natH = img.naturalHeight;
+      if (!avatarCrop.natW || !avatarCrop.natH) { closeAvatarCropper(null); showToast("Couldn't read that image."); return; }
+      // Lay the image out at its natural size so scale() means what it says.
+      img.style.width = avatarCrop.natW + "px";
+      img.style.height = avatarCrop.natH + "px";
+      avatarCrop.baseScale = avatarCrop.stage / Math.min(avatarCrop.natW, avatarCrop.natH);
+      avatarCrop.zoom = 1;
+      // Start centred — the same framing the old blind centre-crop produced, so
+      // a user who just taps Save gets what they used to get.
+      avatarCrop.tx = (avatarCrop.stage - avatarCrop.natW * avatarCrop.baseScale) / 2;
+      avatarCrop.ty = (avatarCrop.stage - avatarCrop.natH * avatarCrop.baseScale) / 2;
+      $("avatar-crop-zoom").value = "1";
+      avatarCropApply();
+    };
+    $("avatar-crop").hidden = false;
+    img.src = avatarCropURL;
+    setTimeout(() => { try { $("avatar-crop-save").focus(); } catch (_) {} }, 0);
+  });
+}
+function closeAvatarCropper(blob) {
+  $("avatar-crop").hidden = true;
+  const img = $("avatar-crop-img");
+  img.onload = null; img.onerror = null;
+  img.removeAttribute("src"); img.style.transform = "";
+  if (avatarCropURL) { URL.revokeObjectURL(avatarCropURL); avatarCropURL = null; }
+  avatarCropPointers.clear(); avatarCropPinch = null;
+  avatarCropMulti = false; avatarCropDownAt = null; avatarCropLastTap = 0;
+  const resolve = avatarCropResolve; avatarCropResolve = null;
+  if (resolve) resolve(blob || null);
+}
+// avatarCropResult rasterises the circle's bounding square at save time. The
+// source rect is the stage square mapped back through the live transform, so
+// what the circle showed is exactly what gets stored.
+async function avatarCropResult() {
+  const s = avatarCrop.baseScale * avatarCrop.zoom;
+  const side = avatarCrop.stage / s;                       // in source pixels
+  const sx = -avatarCrop.tx / s, sy = -avatarCrop.ty / s;
+  const dim = Math.max(1, Math.min(256, Math.round(side))); // never upscale
+  const canvas = document.createElement("canvas");
+  canvas.width = dim; canvas.height = dim;
+  const ctx = canvas.getContext("2d");
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage($("avatar-crop-img"), sx, sy, side, side, 0, 0, dim, dim);
+  return encodeAvatar(canvas);
+}
+
+$("avatar-crop-cancel").addEventListener("click", () => closeAvatarCropper(null));
+$("avatar-crop").addEventListener("click", (e) => { if (e.target.id === "avatar-crop") closeAvatarCropper(null); });
+$("avatar-crop-save").addEventListener("click", async () => {
+  const btn = $("avatar-crop-save"); btn.setAttribute("disabled", "");
+  try {
+    const blob = await avatarCropResult();
+    closeAvatarCropper(blob);
+  } catch (ex) {
+    const err = $("avatar-crop-error");
+    err.textContent = ex.message || "Couldn't use that image.";
+    err.hidden = false;
+  } finally { btn.removeAttribute("disabled"); }
+});
+$("avatar-crop-zoom").addEventListener("input", (e) => {
+  const c = avatarCrop.stage / 2; // the slider has no finger to track: use the centre
+  avatarCropZoomTo(parseFloat(e.target.value) || 1, c, c);
+});
+(() => {
+  const stage = $("avatar-crop-stage");
+  stage.addEventListener("pointerdown", (e) => {
+    stage.setPointerCapture(e.pointerId);
+    const at = avatarCropStagePoint(e);
+    avatarCropPointers.set(e.pointerId, at);
+    if (avatarCropPointers.size === 1) avatarCropDownAt = at;
+    if (avatarCropPointers.size === 2) {
+      avatarCropMulti = true;
+      const [a, b] = [...avatarCropPointers.values()];
+      avatarCropPinch = {
+        dist: Math.hypot(a.x - b.x, a.y - b.y) || 1, zoom: avatarCrop.zoom,
+        cx: (a.x + b.x) / 2, cy: (a.y + b.y) / 2,
+      };
+    }
+  });
+  stage.addEventListener("pointermove", (e) => {
+    const prev = avatarCropPointers.get(e.pointerId);
+    if (!prev) return;
+    const now = avatarCropStagePoint(e);
+    avatarCropPointers.set(e.pointerId, now);
+    if (avatarCropPointers.size >= 2 && avatarCropPinch) {
+      const [a, b] = [...avatarCropPointers.values()];
+      const dist = Math.hypot(a.x - b.x, a.y - b.y) || 1;
+      avatarCropZoomTo(avatarCropPinch.zoom * (dist / avatarCropPinch.dist), avatarCropPinch.cx, avatarCropPinch.cy);
+      return;
+    }
+    avatarCrop.tx += now.x - prev.x;
+    avatarCrop.ty += now.y - prev.y;
+    avatarCropApply();
+  });
+  const release = (e) => {
+    avatarCropPointers.delete(e.pointerId);
+    if (avatarCropPointers.size < 2) avatarCropPinch = null;
+    if (avatarCropPointers.size === 0) {
+      // Double-tap to toggle zoom, hand-rolled the same way the image viewer
+      // does it (ivLastTap) rather than via dblclick, which this WebView does
+      // not fire reliably for touch. A gesture that was ever a pinch, or that
+      // moved, is a pan — not a tap.
+      const p = avatarCropStagePoint(e);
+      const moved = avatarCropDownAt && Math.hypot(p.x - avatarCropDownAt.x, p.y - avatarCropDownAt.y) > 10;
+      const now = Date.now();
+      if (!avatarCropMulti && !moved && now - avatarCropLastTap < 300) {
+        avatarCropZoomTo(avatarCrop.zoom > 1 ? 1 : 2, p.x, p.y);
+        avatarCropLastTap = 0;
+      } else if (!avatarCropMulti && !moved) {
+        avatarCropLastTap = now;
+      }
+      avatarCropMulti = false;
+    }
+  };
+  stage.addEventListener("pointerup", release);
+  stage.addEventListener("pointercancel", release);
+  if (window.ResizeObserver) new ResizeObserver(avatarCropRemeasure).observe(stage);
+  stage.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const p = avatarCropStagePoint(e);
+    avatarCropZoomTo(avatarCrop.zoom * (e.deltaY < 0 ? 1.12 : 1 / 1.12), p.x, p.y);
+  }, { passive: false });
+})();
+
 
 // One MB in bytes, used to convert the byte budget the server stores to and from
 // the MB the settings field shows.
@@ -1032,7 +1545,76 @@ async function loadContacts() {
   const { ok, body } = await api("/api/contacts");
   if (!ok) return;
   contacts = body.contacts || [];
+  announceAccepts();
   renderContacts();
+}
+
+// Contact statuses as of the previous load, so a flip can be spotted.
+// A request the user sent sits at "pending_out" until the other side's accept
+// reaches us, and that arrival is the only moment it is ever announced —
+// nothing re-sends it later. Without this the row just quietly stops saying
+// "Requested", which the user has no reason to be looking at.
+let seenStatus = new Map();
+function announceAccepts() {
+  const fresh = [];
+  const next = new Map();
+  for (const c of contacts) {
+    next.set(c.account, c.status);
+    // pending_out → accepted is exactly "they said yes": either their accept
+    // landed, or we each requested the other and it resolved as mutual.
+    if (seenStatus.get(c.account) === "pending_out" && c.status === "accepted") fresh.push(c);
+  }
+  const firstLoad = seenStatus.size === 0;
+  seenStatus = next;
+  if (firstLoad) return; // the state we started with is not news
+  for (const c of fresh) {
+    const name = contactLabel(c);
+    const open = () => { setTab("chats"); openChat(c.account); };
+    showToast(name + " accepted your friend request", open);
+    // Same guard order as maybeNotify: notifsOn is false where the Notification
+    // API isn't there (the Android shell posts its own system notification for
+    // this, from the backend's friend-accept hook).
+    if (!notifsOn || Notification.permission !== "granted") continue;
+    try {
+      const n = new Notification(name, { body: "accepted your friend request", tag: "accept-" + c.account });
+      n.onclick = () => { window.focus(); open(); };
+    } catch (_) {}
+  }
+}
+
+// showToast drops a Material-3-style snackbar over the bottom of the screen.
+// One visible at a time (newest replaces with a crossfade); tapping it runs
+// onTap (and dismisses); it disappears on its own either way. `action` renders
+// a labeled M3 action button beside the text.
+let toastCurrent = null;
+function showToast(text, onTap, opts = {}) {
+  if (toastCurrent) { toastCurrent.remove(); toastCurrent = null; }
+  const el = document.createElement("div");
+  el.className = "toast";
+  el.setAttribute("role", "status");
+  const label = document.createElement("span");
+  label.textContent = text;
+  el.append(label);
+  if (opts.action) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "toast-action";
+    btn.textContent = opts.action;
+    btn.addEventListener("click", () => { el.remove(); toastCurrent = null; opts.onAction && opts.onAction(); });
+    el.append(btn);
+  }
+  if (onTap) {
+    el.classList.add("tappable");
+    el.addEventListener("click", () => { el.remove(); toastCurrent = null; onTap(); });
+  }
+  document.body.append(el);
+  toastCurrent = el;
+  const life = opts.duration || 6000;
+  setTimeout(() => {
+    if (el !== toastCurrent) return;
+    el.classList.add("leaving");
+    setTimeout(() => { el.remove(); if (toastCurrent === el) toastCurrent = null; }, 250);
+  }, life);
 }
 async function loadGroups() {
   const { ok, body } = await api("/api/groups");
@@ -1040,6 +1622,7 @@ async function loadGroups() {
   groups = body.groups || [];
   renderContacts();
   if (detailContent === "group-info") renderGroupInfo();
+  if (detailContent === "contact-info") renderContactInfo();
 }
 async function loadGroupInvites() {
   const { ok, body } = await api("/api/groups/invites");
@@ -1061,6 +1644,10 @@ async function loadMessages() {
   pruneImageURLs();
   maybeNotify(prevSeen);
   if (detailContent === "chat") renderMessages();
+  if (detailContent === "contact-info") renderContactInfo();
+  // Fire-and-forget: copying a photo into the gallery must never delay the
+  // chat render or block the poll loop behind a slow MediaStore write.
+  autoSaveNewMedia();
 }
 
 // pruneImageURLs revokes and drops cached blob: URLs for images that are no
@@ -1260,16 +1847,21 @@ function renderGroupItem(g) {
   const item = document.createElement("md-list-item");
   item.setAttribute("type", "button");
   item.dataset.group = g.id;
-  const head = document.createElement("div");
-  head.setAttribute("slot", "headline");
+  // Leading avatar goes in md-list-item's own `start` slot, not inside the
+  // headline text. Inlined into the headline it pushed the name across while
+  // the supporting text stayed at the left edge, so the two lines of a row
+  // didn't share a text column — the M3 list item aligns them.
   const badge = document.createElement("span");
+  badge.setAttribute("slot", "start");
   badge.className = "group-avatar";
   badge.innerHTML = '<svg class="icon"><use href="#ic-group"/></svg>';
-  head.append(badge, " ", g.name || "Group");
+  const head = document.createElement("div");
+  head.setAttribute("slot", "headline");
+  head.textContent = g.name || "Group";
   const sub = document.createElement("div");
   sub.setAttribute("slot", "supporting-text");
   sub.textContent = lastGroupPreview(g.id) || (g.member_count + (g.member_count === 1 ? " member" : " members"));
-  item.append(head, sub);
+  item.append(badge, head, sub);
   const at = lastGroupMsgAt(g.id);
   const meta = document.createElement("div");
   meta.setAttribute("slot", "trailing-supporting-text");
@@ -1291,13 +1883,15 @@ function renderContacts() {
     const item = document.createElement("md-list-item");
     if (accepted) { item.setAttribute("type", "button"); item.dataset.account = c.account; }
     else item.classList.add("pending-contact");
-    const head = document.createElement("div");
-    head.setAttribute("slot", "headline");
-    head.className = "contact-headline";
     // Avatar leads the row (picture or initials), with the presence dot overlaid
     // on its corner for accepted contacts. Pending contacts show no presence.
-    head.append(avatarNode(c.avatar_hash, c.name || shortAccount(c.account), accepted ? c.presence : null), " ");
-    head.append(c.name || shortAccount(c.account));
+    // It occupies md-list-item's `start` slot so the headline and the supporting
+    // text below it share one text column (see renderGroupItem).
+    const lead = avatarNode(c.avatar_hash, contactLabel(c), accepted ? c.presence : null);
+    lead.setAttribute("slot", "start");
+    const head = document.createElement("div");
+    head.setAttribute("slot", "headline");
+    head.textContent = contactLabel(c);
     const sub = document.createElement("div");
     sub.setAttribute("slot", "supporting-text");
     // awaiting_accept means we accepted them but the message telling them so
@@ -1305,7 +1899,7 @@ function renderContacts() {
     // they can't message us until it lands. Say so rather than looking done.
     if (accepted && c.awaiting_accept) sub.textContent = "Accepted · still trying to tell them — they can't reply yet";
     else sub.textContent = accepted ? (lastMsgPreview(c.account) || "No messages yet") : "Request sent · waiting for them to accept";
-    item.append(head, sub);
+    item.append(lead, head, sub);
 
     if (accepted) {
       const at = lastMsgAt(c.account);
@@ -1325,7 +1919,11 @@ function renderContacts() {
     }
     list.append(item);
   }
-  $("no-contacts").hidden = orderedConversations().length > 0;
+  const noContacts = orderedConversations().length === 0;
+  $("no-contacts").hidden = !noContacts;
+  // One "start something" affordance at a time: the empty state already offers
+  // Add someone, so the FAB steps aside while it's visible.
+  if (currentTab === "chats") $("fab-add").hidden = noContacts;
   if ($("empty-scan-btn")) $("empty-scan-btn").hidden = !scanSupported();
   const cb = $("chat-badge");
   if (cb) { const n = totalUnread(); cb.textContent = n; cb.hidden = n === 0; }
@@ -1340,22 +1938,24 @@ function searchContactItem(c) {
   const item = document.createElement("md-list-item");
   item.setAttribute("type", "button");
   item.dataset.account = c.account;
+  const name = contactLabel(c);
+  const lead = avatarNode(c.avatar_hash, name, c.presence);
+  lead.setAttribute("slot", "start");
   const head = document.createElement("div");
   head.setAttribute("slot", "headline");
-  head.className = "contact-headline";
-  const name = c.name || shortAccount(c.account);
-  head.append(avatarNode(c.avatar_hash, name, c.presence), " ", name);
+  head.textContent = name;
   const sub = document.createElement("div");
   sub.setAttribute("slot", "supporting-text");
   sub.textContent = lastMsgPreview(c.account) || shortAccount(c.account);
-  item.append(head, sub);
+  item.append(lead, head, sub);
   return item;
 }
 // Names-only match: a contact's display name OR account number; a group's name.
 function convMatches(it, q) {
   if (it.kind === "group") return (it.g.name || "Group").toLowerCase().includes(q);
   const c = it.c;
-  return (c.name || "").toLowerCase().includes(q) || c.account.toLowerCase().includes(q);
+  return contactLabel(c).toLowerCase().includes(q) || (c.name || "").toLowerCase().includes(q) ||
+    c.account.toLowerCase().includes(q);
 }
 function renderSearchResults(raw) {
   const box = $("search-results");
@@ -1372,6 +1972,7 @@ function renderSearchResults(raw) {
     emptyText.textContent = q === "" ? "No chats or contacts yet." : `No chats or contacts found for "${raw.trim()}".`;
     empty.hidden = false;
   } else empty.hidden = true;
+  syncSearchClear();
 }
 function openSearch() {
   $("search-view").hidden = false;
@@ -1381,12 +1982,21 @@ function openSearch() {
   i.focus();
 }
 function closeSearch() { $("search-input").blur(); $("search-view").hidden = true; }
+// The trailing clear affordance an M3 search view carries: present only while
+// there is something to clear, and it returns focus to the field so the user
+// can keep typing rather than being dropped out of the search.
+function syncSearchClear() {
+  $("search-clear").hidden = $("search-input").value === "";
+}
 
 function renderRequests() {
   // Browser notification for new friend requests (desktop only; Android uses JNI callbacks).
   if (requests.length > prevRequestCount && prevRequestCount > 0 && "Notification" in window && Notification.permission === "granted") {
     const newReq = requests[requests.length - 1];
-    new Notification("Friend request", { body: (newReq.name || "Someone") + " wants to connect with you" });
+    // contactLabel, not .name: someone you had already nicknamed can request you
+    // again (after a remove), and the desktop notification must agree with the
+    // row behind it. The Android twin of this is contactDisplayNameLocked().
+    new Notification("Friend request", { body: contactLabel(newReq, "Someone") + " wants to connect with you" });
   }
   prevRequestCount = requests.length;
   const list = $("requests-list");
@@ -1395,7 +2005,7 @@ function renderRequests() {
     const row = document.createElement("div");
     row.className = "request-row";
     const info = document.createElement("div");
-    const name = document.createElement("div"); name.className = "body"; name.textContent = r.name || "(no name)";
+    const name = document.createElement("div"); name.className = "body"; name.textContent = contactLabel(r, "(no name)");
     const short = document.createElement("div"); short.className = "label muted"; short.textContent = shortAccount(r.account);
     info.append(name, short);
     const actions = document.createElement("div"); actions.className = "request-actions";
@@ -1418,7 +2028,7 @@ function renderRelayRequests() {
     const row = document.createElement("div");
     row.className = "request-row relay-req-row";
     const info = document.createElement("div");
-    const name = document.createElement("div"); name.className = "body"; name.textContent = c.name || shortAccount(c.account);
+    const name = document.createElement("div"); name.className = "body"; name.textContent = contactLabel(c);
     const disc = document.createElement("div"); disc.className = "label muted";
     disc.textContent = "Wants to use you as a relay. Your device will occasionally connect to people you don't know to pass along their messages — you can't read them. Revoke anytime.";
     info.append(name, disc);
@@ -1468,6 +2078,38 @@ function updateScrollBtn() {
   const btn = $("scroll-bottom-btn");
   if (btn) btn.hidden = !(detailContent === "chat" && !stickBottom);
 }
+// ---- message runs ----
+// Consecutive messages from the same sender, close enough together in time, are
+// drawn as one run: only the LAST bubble carries the timestamp and the delivery
+// status, and only it keeps the tail corner. Everything above it is just the
+// bubble, tucked up against its neighbour.
+//
+// A failed message never joins a run, in either direction. It owns an error line
+// and a "Tap to retry" button, and those have to stay attached to the message
+// they act on — collapsing them into a neighbour's footer would hide a failure
+// or put the retry on the wrong message.
+const MSG_RUN_WINDOW_MS = 5 * 60 * 1000;
+function msgStatusKey(m) {
+  if (!m || m.direction !== "out") return "in";
+  if (m.delivery === "failed") return "failed";
+  if (m.delivery === "pending" || m.delivery === "queued") return "pending";
+  return "delivered"; // the flag is cleared on ack, so "no flag" means delivered
+}
+function sameMsgRun(prev, m) {
+  if (!prev || !m) return false;
+  if (prev.direction !== m.direction) return false;
+  if ((prev.author || "") !== (m.author || "")) return false;
+  if (prev.delivery === "failed" || m.delivery === "failed") return false;
+  const dt = new Date(m.at) - new Date(prev.at);
+  return Number.isFinite(dt) && dt >= 0 && dt <= MSG_RUN_WINDOW_MS;
+}
+// Whether this message shows its own delivery status. Normally only the last of
+// a run does, but a message whose state DIFFERS from the next one's keeps its
+// own — otherwise one still-sending message hides behind a later delivered one.
+function showsOwnStatus(m, next, runWithNext) {
+  return !runWithNext || msgStatusKey(m) !== msgStatusKey(next);
+}
+
 function renderMessages(forceBottom = false) {
   if (chatKind === "group") { renderGroupMessages(forceBottom); return; }
   const box = $("messages");
@@ -1482,40 +2124,73 @@ function renderMessages(forceBottom = false) {
   if (convo.length === 0) {
     box.append(emptyState("ic-chat", "No messages yet", "Say hello — you both need to be online."));
   }
-  for (const m of convo) {
+  for (let i = 0; i < convo.length; i++) {
+    const m = convo[i];
+    const next = convo[i + 1];
+    const runWithPrev = sameMsgRun(convo[i - 1], m);
+    const runWithNext = sameMsgRun(m, next);
     const row = document.createElement("div");
-    row.className = "bubble-row " + (m.direction === "out" ? "out" : "in");
+    row.className = "bubble-row " + (m.direction === "out" ? "out" : "in") + (runWithPrev ? " grouped" : "");
     row.dataset.msgId = m.id;
     const b = document.createElement("div");
-    b.className = "bubble " + (m.direction === "out" ? "out" : "in") + (m.delivery === "failed" ? " failed" : "");
+    b.className = "bubble " + (m.direction === "out" ? "out" : "in") +
+      (m.delivery === "failed" ? " failed" : "") + (runWithNext ? "" : " tail");
     if (m.reply_to) b.append(quoteElement(m.reply_to));
-    if (m.kind === "image") { b.classList.add("image"); b.append(imageElement(m.id)); }
+    if (m.kind === "image") { b.classList.add("image"); b.append(imageElement(m.id, m.delivery)); }
     else b.append(textNode(m.text));
-    const t = document.createElement("div");
-    t.className = "bubble-time";
-    t.textContent = fmtTime(m.at);
-    row.append(b, t);
+    row.append(b);
+    // The run's footer sits under its last bubble only.
+    if (!runWithNext) {
+      const t = document.createElement("div");
+      t.className = "bubble-time";
+      t.textContent = fmtTime(m.at);
+      row.append(t);
+    }
     const rx = reactionsElement(m);
     if (rx) row.append(rx);
 
-    // Delivery state is the backend's, read straight off the message.
-    if (m.direction === "out" && m.delivery) {
-      const status = document.createElement("div");
-      status.className = "msg-status" + (m.delivery === "failed" ? " error" : "");
+    // Delivery state is the backend's, read straight off the message. The
+    // protocol only stores "pending" / "failed"; the flag is CLEARED on ack, so
+    // an outgoing message with no flag is a delivered one. Success is an
+    // EXPLICIT terminal state (check + "Delivered"), not the absence of
+    // "Sending…" — the old behaviour made arrival indistinguishable from a
+    // status that never existed.
+    if (m.direction === "out" && showsOwnStatus(m, next, runWithNext)) {
       if (m.delivery === "failed") {
-        status.textContent = "Not delivered — " + (m.error || "couldn't send") + " · tap to retry";
-        status.dataset.retry = m.id;
-        status.style.cursor = "pointer";
-      } else {
+        const status = document.createElement("div");
+        status.className = "msg-status error";
+        status.textContent = m.error || "couldn't send";
+        row.append(status);
+        const retry = document.createElement("button");
+        retry.type = "button";
+        retry.className = "msg-retry";
+        retry.dataset.retry = m.id;
+        retry.innerHTML = '<svg class="icon" aria-hidden="true"><use href="#ic-refresh"/></svg>Tap to retry';
+        row.append(retry);
+        if (m.relay_available) {
+          const relay = document.createElement("button");
+          relay.className = "relay-offer";
+          relay.textContent = "Still trying — send via a friend's relay?";
+          relay.dataset.relaySend = m.id;
+          row.append(relay);
+        }
+      } else if (m.delivery === "pending" || m.delivery === "queued") {
+        const status = document.createElement("div");
+        status.className = "msg-status";
         status.textContent = "Sending…";
-      }
-      row.append(status);
-      if (m.delivery === "failed" && m.relay_available) {
-        const relay = document.createElement("button");
-        relay.className = "relay-offer";
-        relay.textContent = "Still trying — send via a friend's relay?";
-        relay.dataset.relaySend = m.id;
-        row.append(relay);
+        row.append(status);
+      } else {
+        // delivered / read / any other terminal success value
+        const status = document.createElement("div");
+        status.className = "msg-status delivered";
+        const tick = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+        tick.setAttribute("class", "icon");
+        tick.setAttribute("aria-hidden", "true");
+        const use = document.createElementNS("http://www.w3.org/2000/svg", "use");
+        use.setAttribute("href", "#ic-check");
+        tick.append(use);
+        status.append(tick, document.createTextNode("Delivered"));
+        row.append(status);
       }
     }
 
@@ -1586,31 +2261,69 @@ function renderGroupMessages(forceBottom = false) {
   if (convo.length === 0) {
     box.append(emptyState("ic-group", "No messages yet", "Say hello to the group."));
   }
-  let lastAuthor = null;
-  for (const m of convo) {
+  for (let i = 0; i < convo.length; i++) {
+    const m = convo[i];
+    const next = convo[i + 1];
     const out = m.direction === "out";
+    const runWithPrev = sameMsgRun(convo[i - 1], m);
+    const runWithNext = sameMsgRun(m, next);
     const row = document.createElement("div");
-    row.className = "bubble-row " + (out ? "out" : "in");
+    row.className = "bubble-row " + (out ? "out" : "in") + (runWithPrev ? " grouped" : "");
     row.dataset.msgId = m.id;
-    if (!out && m.author !== lastAuthor) {
+    // The author label heads each run, same boundary the footer closes.
+    if (!out && !runWithPrev) {
       const who = document.createElement("div");
       who.className = "bubble-author label muted";
       who.textContent = m.author_name || shortAccount(m.author || "");
       row.append(who);
     }
     const b = document.createElement("div");
-    b.className = "bubble " + (out ? "out" : "in");
+    b.className = "bubble " + (out ? "out" : "in") +
+      (m.delivery === "failed" ? " failed" : "") + (runWithNext ? "" : " tail");
     if (m.reply_to) b.append(quoteElement(m.reply_to));
     if (m.kind === "image") { b.classList.add("image"); b.append(groupImageElement(m)); }
     else b.append(textNode(m.text));
-    const t = document.createElement("div");
-    t.className = "bubble-time";
-    t.textContent = fmtTime(m.at);
-    row.append(b, t);
+    row.append(b);
+    if (!runWithNext) {
+      const t = document.createElement("div");
+      t.className = "bubble-time";
+      t.textContent = fmtTime(m.at);
+      row.append(t);
+    }
     const rx = reactionsElement(m);
     if (rx) row.append(rx);
+    // Same delivery language as 1:1 chats — groups used to show nothing at all.
+    if (out && showsOwnStatus(m, next, runWithNext)) {
+      if (m.delivery === "failed") {
+        const status = document.createElement("div");
+        status.className = "msg-status error";
+        status.textContent = m.error || "couldn't send";
+        row.append(status);
+        const retry = document.createElement("button");
+        retry.type = "button";
+        retry.className = "msg-retry";
+        retry.dataset.retry = m.id;
+        retry.innerHTML = '<svg class="icon" aria-hidden="true"><use href="#ic-refresh"/></svg>Tap to retry';
+        row.append(retry);
+      } else if (m.delivery === "pending") {
+        const status = document.createElement("div");
+        status.className = "msg-status";
+        status.textContent = "Sending…";
+        row.append(status);
+      } else {
+        const status = document.createElement("div");
+        status.className = "msg-status delivered";
+        const tick = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+        tick.setAttribute("class", "icon");
+        tick.setAttribute("aria-hidden", "true");
+        const use = document.createElementNS("http://www.w3.org/2000/svg", "use");
+        use.setAttribute("href", "#ic-check");
+        tick.append(use);
+        status.append(tick, document.createTextNode("Delivered"));
+        row.append(status);
+      }
+    }
     box.append(row);
-    lastAuthor = out ? null : m.author;
   }
   settleMessagesScroll(stick);
 }
@@ -1650,7 +2363,7 @@ function buildDiagSnapshot(ver, id) {
   let reach;
   if (!id.tor_enabled) reach = "Tor disabled";
   else if (id.tor_ready) reach = "online — reachable";
-  else if (id.tor_sendable) reach = "publishing — can send, address not yet published";
+  else if (id.tor_sendable) reach = "publishing — can send, address not yet published" + publishElapsedSuffix();
   else if (torConnectingSince > 0 && Date.now() - torConnectingSince > TOR_STALLED_MS) reach = "stalled — check your internet";
   else reach = "connecting";
   return [
@@ -1661,13 +2374,21 @@ function buildDiagSnapshot(ver, id) {
     "Runtime:  " + (v.go_version || "?") + " " + (v.os || "?") + "/" + (v.arch || "?"),
     "Device:   " + (deviceRoleText || "unknown"),
     "Account:  " + acctShort,
-    "Onion:    " + (id.tor_hs_state || "unknown") + " · bootstrap " + frac + "% · sendable=" + !!id.tor_sendable + " · reachable=" + !!id.tor_ready,
+    // tor_service_state is arti's own word for what the service is doing, and is
+    // the line that distinguishes a first publish still in flight from one that
+    // is retrying after failed uploads. Absent on the desktop sidecar, which
+    // scrapes a log and cannot ask.
+    "Onion:    " + (id.tor_hs_state || "unknown") + (id.tor_service_state ? " · service " + id.tor_service_state : "") + " · bootstrap " + frac + "% · sendable=" + !!id.tor_sendable + " · reachable=" + !!id.tor_ready,
     "Reach:    " + reach,
   ].join("\n");
 }
 
 let diagPollTimer = null;
 
+// The pill is both a status indicator and the fastest route into Diagnostics
+// (You › Preferences › Help still has the labeled entry). Restored after the
+// polish pass made it passive — users reach for it as "the log button".
+$("tor-pill").addEventListener("click", openDiagnostics);
 async function openDiagnostics() {
   const dialog = $("tor-log-dialog");
   const snap = $("diag-snapshot");
@@ -1699,7 +2420,6 @@ async function openDiagnostics() {
   }, 3000);
 }
 
-$("tor-pill").addEventListener("click", openDiagnostics);
 $("open-diagnostics-btn").addEventListener("click", openDiagnostics);
 
 // Outbound links (Donate / Report a bug). TODO: swap these placeholders for the
@@ -1785,7 +2505,7 @@ $("view-phrase-copy").addEventListener("click", async () => {
     const ta = document.createElement("textarea"); ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
     document.body.appendChild(ta); ta.select(); document.execCommand("copy"); document.body.removeChild(ta);
   }
-  const b = $("view-phrase-copy"); b.textContent = "Copied!"; setTimeout(() => { b.textContent = "Copy"; }, 2000);
+  showToast("Recovery phrase copied");
 });
 $("view-phrase-download").addEventListener("click", () => {
   if (!revealedPhrase) return;
@@ -1799,7 +2519,7 @@ $("view-phrase-download").addEventListener("click", () => {
 $("diag-copy").addEventListener("click", async () => {
   const text = $("diag-snapshot").textContent + "\n\n── Tor log ──────────────\n" + $("tor-log-content").textContent;
   try { await navigator.clipboard.writeText(text); } catch (_) {}
-  const fb = $("diag-copy-feedback"); fb.hidden = false; setTimeout(() => { fb.hidden = true; }, 1500);
+  showToast("Diagnostics copied");
 });
 $("tor-log-close").addEventListener("click", () => { clearInterval(diagPollTimer); $("tor-log-dialog").close(); });
 $("tor-log-dialog").addEventListener("click", (e) => {
@@ -1812,10 +2532,8 @@ $("fab-add").addEventListener("click", openAdd);
 $("empty-add-btn").addEventListener("click", openAdd);
 $("empty-scan-btn").addEventListener("click", openScan);
 $("empty-group-btn").addEventListener("click", () => { openAdd(); setAddMode("group"); });
-$("empty-paste-btn").addEventListener("click", () => {
-  openAdd();
-  setTimeout(() => $("find-account").focus(), 100);
-});
+// (Paste lives on the Add screen itself, so the empty state no longer needs a
+// fourth duplicate CTA.)
 // Requests empty state: same two paths as elsewhere, no new surfaces. "Add
 // someone" opens the add sheet (which itself reveals the scan button only when a
 // camera is present, so there's no dead scan control); "Share my code" jumps to
@@ -1855,6 +2573,13 @@ $("contacts-list").addEventListener("click", async (e) => {
 
 // Search overlay wiring.
 $("search-btn").addEventListener("click", openSearch);
+$("search-clear").addEventListener("click", () => {
+  const i = $("search-input");
+  i.value = "";
+  renderSearchResults("");
+  syncSearchClear();
+  i.focus();
+});
 $("search-close").addEventListener("click", closeSearch);
 $("search-input").addEventListener("input", (e) => renderSearchResults(e.target.value));
 $("search-input").addEventListener("keydown", (e) => { if (e.key === "Escape") closeSearch(); });
@@ -1904,8 +2629,8 @@ $("group-menu").addEventListener("click", async (e) => {
 $("chat-menu").addEventListener("click", async (e) => {
   const btn = e.target.closest("button"); if (!btn) return;
   $("chat-menu").hidden = true;
+  if (btn.dataset.action === "cinfo") { openContactInfo(); return; }
   const acct = currentPeer;
-  if (btn.dataset.action === "view") { openContactInfo(); return; }
   if (btn.dataset.action === "relay") {
     btn.setAttribute("disabled", "");
     const { ok, body } = await api("/api/relay/request", { method: "POST", body: JSON.stringify({ account: acct }) });
@@ -1939,9 +2664,6 @@ $("relay-requests-list").addEventListener("click", async (e) => {
   else return;
   await loadContacts();
 });
-$("contact-info-copy").addEventListener("click", async () => {
-  try { await navigator.clipboard.writeText(currentPeer); } catch (_) {}
-});
 
 // ---------- events: auth ----------
 async function doUnlock(password) {
@@ -1956,7 +2678,7 @@ async function doUnlock(password) {
     else if (body.retry_after) msg += " Try again in " + body.retry_after + "s.";
     return { ok: false, error: msg };
   }
-  sessionToken = body.session_token;
+  setSessionToken(body.session_token);
   await showUnlocked();
   return { ok: true };
 }
@@ -1980,6 +2702,7 @@ $("unlock-form").addEventListener("submit", async (e) => {
 $("pin-keypad-grid")?.addEventListener("click", (e) => {
   const btn = e.target.closest("button");
   if (!btn) return;
+  haptic(8); // Android PIN pads tick per key; the helper is a no-op elsewhere.
   if (btn.dataset.num !== undefined) {
     // PINs are 6+ digits with no fixed length, so we never auto-submit — the
     // user always taps the ✓ key (or presses Enter). Auto-submitting at 6 would
@@ -2010,10 +2733,11 @@ $("pin-form").addEventListener("submit", async (e) => {
   updatePinDots();
 
   const { ok, status, body } = await api("/api/pin/unlock", { method: "POST", body: JSON.stringify({ pin: code }) });
-  if (ok) { sessionToken = body.session_token; return showUnlocked(); }
+  if (ok) { setSessionToken(body.session_token); return showUnlocked(); }
 
   if (isAndroid && pinEnabled) {
     renderPinKeypad(); // Scramble keypad numbers on failed attempt
+    if (shufflePin) showToast("Keypad shuffled", null, { duration: 2500 });
   }
 
   if (status === 403 || status === 409) {
@@ -2025,12 +2749,22 @@ $("pin-form").addEventListener("submit", async (e) => {
     ue.hidden = false;
     return;
   }
+  const leftEl = $("pin-attempts");
+  if (leftEl) leftEl.hidden = true;
   if (status === 429) {
-    err.textContent = "Too many attempts. Try again in " + (body.retry_after || 0) + "s, or use your password.";
+    err.textContent = "Too many attempts.";
+    if (leftEl) { leftEl.textContent = "Try again in " + (body.retry_after || 0) + "s, or use your password."; leftEl.hidden = false; }
   } else {
     const left = body.attempts_left;
-    err.textContent = (body.error || "Incorrect PIN.") +
-      (typeof left === "number" ? " " + left + " attempt" + (left === 1 ? "" : "s") + " left before PIN unlock is removed." : "");
+    err.textContent = body.error || "Incorrect PIN.";
+    // Countdown is its own line — burying it mid-sentence made the most
+    // consequential number on the screen easy to skim past.
+    if (leftEl) {
+      if (typeof left === "number") {
+        leftEl.textContent = left + " attempt" + (left === 1 ? "" : "s") + " left before PIN unlock is removed.";
+        leftEl.hidden = false;
+      } else leftEl.hidden = true;
+    }
   }
   err.hidden = false;
 });
@@ -2088,28 +2822,89 @@ function renderPinState() {
     : "Off — this device asks for your password every time";
   $("pin-off-btn").hidden = !pinEnabled;
   $("edit-pin-btn").hidden = pinEnabled;
-  if (pinEnabled) $("edit-dialog").hidden = true;
 }
 $("edit-pin-btn").addEventListener("click", async () => {
-  const result = await editDialog({
-    title: "Set up PIN unlock",
-    passwordFirst: true,
-    fields: [
-      { id: "pin", label: "New PIN (6+ digits)", type: "password", inputmode: "numeric" },
-      { id: "pin2", label: "Confirm PIN", type: "password", inputmode: "numeric" },
-    ],
-  });
-  if (!result) return;
-  const password = result.password, code = result.pin;
-  if (code !== result.pin2) return; // PINs don't match
-  const { ok, body } = await api("/api/security", { method: "POST", body: JSON.stringify({ action: "pin-enable", password, code }) });
-  if (!ok) {
-    // Show error in the dialog — reopen with error message
-    await editDialog({ title: "Set up PIN unlock", fields: [{ id: "_err", label: body.error || "Could not turn on PIN unlock.", type: "text" }] });
+  // Keep the dialog open across validation/API failures: mismatch shows an
+  // inline error and preserves what was typed; the API error re-opens with a
+  // static error message (never an editable "field" containing the error).
+  let values = {};
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const result = await editDialog({
+      title: "Set up PIN unlock",
+      passwordFirst: true,
+      confirmLabel: "Turn on PIN",
+      values,
+      fields: [
+        { id: "pin", label: "New PIN (6+ digits)", type: "password", inputmode: "numeric" },
+        { id: "pin2", label: "Confirm PIN", type: "password", inputmode: "numeric" },
+      ],
+    });
+    if (!result) return;
+    values = { pin: result.pin, pin2: result.pin2 };
+    if (!result.password) {
+      values.password = "";
+      await editDialog({
+        title: "Set up PIN unlock",
+        passwordFirst: true,
+        confirmLabel: "Turn on PIN",
+        values,
+        errorMessage: "Enter your password to confirm.",
+        fields: [
+          { id: "pin", label: "New PIN (6+ digits)", type: "password", inputmode: "numeric" },
+          { id: "pin2", label: "Confirm PIN", type: "password", inputmode: "numeric" },
+        ],
+      });
+      continue;
+    }
+    const code = (result.pin || "").trim();
+    if (!/^\d{6,}$/.test(code)) {
+      await editDialog({
+        title: "Set up PIN unlock",
+        passwordFirst: true,
+        confirmLabel: "Turn on PIN",
+        values,
+        errorMessage: "PINs must be at least 6 digits.",
+        fields: [
+          { id: "pin", label: "New PIN (6+ digits)", type: "password", inputmode: "numeric" },
+          { id: "pin2", label: "Confirm PIN", type: "password", inputmode: "numeric" },
+        ],
+      });
+      continue;
+    }
+    if (code !== (result.pin2 || "").trim()) {
+      await editDialog({
+        title: "Set up PIN unlock",
+        passwordFirst: true,
+        confirmLabel: "Turn on PIN",
+        values,
+        errorMessage: "The two PINs don't match — try again.",
+        fields: [
+          { id: "pin", label: "New PIN (6+ digits)", type: "password", inputmode: "numeric" },
+          { id: "pin2", label: "Confirm PIN", type: "password", inputmode: "numeric" },
+        ],
+      });
+      continue;
+    }
+    const { ok, body } = await api("/api/security", { method: "POST", body: JSON.stringify({ action: "pin-enable", password: result.password, code }) });
+    if (!ok) {
+      await editDialog({
+        title: "Set up PIN unlock",
+        passwordFirst: true,
+        confirmLabel: "Turn on PIN",
+        values,
+        errorMessage: body.error || "Could not turn on PIN unlock.",
+        fields: [
+          { id: "pin", label: "New PIN (6+ digits)", type: "password", inputmode: "numeric" },
+          { id: "pin2", label: "Confirm PIN", type: "password", inputmode: "numeric" },
+        ],
+      });
+      continue;
+    }
+    pinEnabled = true;
+    renderPinState();
+    showToast("PIN unlock is on");
     return;
   }
-  pinEnabled = true;
-  renderPinState();
 });
 // ---------- erase after failed unlocks (You tab) ----------
 // Opt-in: after N failed unlocks in a row this device erases the account (the
@@ -2264,7 +3059,7 @@ $("pin-off-btn").addEventListener("click", async () => {
   renderPinState();
 });
 function resetSessionState() {
-  sessionToken = null;
+  setSessionToken(null);
   contacts = []; requests = []; messages = []; currentPeer = null; myName = ""; detailContent = null;
   groups = []; groupInvites = []; groupMembers = []; groupInfoCtx = {}; currentGroup = null; chatKind = null;
   for (const url of imageURLs.values()) URL.revokeObjectURL(url);
@@ -2290,12 +3085,19 @@ $("remove-account-btn").addEventListener("click", async () => {
     danger: true,
   });
   if (!ok) return;
-  // Prompt for password to confirm the destructive action.
-  const password = window.prompt("Enter your password to confirm:");
-  if (!password) return;
+  // Password confirmation via the app's own dialog — window.prompt is a silent
+  // no-op in the Android WebView (no onJsPrompt handler), which made the most
+  // destructive button in the app appear to do nothing.
+  const result = await editDialog({
+    title: "Confirm your password",
+    passwordFirst: true,
+    confirmLabel: "Erase everything",
+    fields: [],
+  });
+  if (!result || !result.password) return;
   const { ok: success, body } = await api("/api/delete-identity", {
     method: "POST",
-    body: JSON.stringify({ password }),
+    body: JSON.stringify({ password: result.password }),
   });
   if (!success) {
     await confirmDialog({ title: "Could not remove account", message: body.error || "Incorrect password.", confirmLabel: "OK", cancelLabel: "" });
@@ -2345,6 +3147,7 @@ async function loadDesktop() {
   const { ok, body } = await api("/api/desktop");
   if (!ok) return;
   desktopAvailable = !!body.available;
+  $("refresh-btn").hidden = !desktopAvailable;
   renderNotice(body.notice || "");
 
   const section = $("autostart-section");
@@ -2375,6 +3178,45 @@ async function setAutostart(on) {
 }
 $("autostart-switch").addEventListener("change", (e) => setAutostart(e.target.selected));
 
+// ---------- single-use invite code ----------
+// A toggle for a one-time friend-request code that burns after one add. The bare
+// account number keeps working regardless — this only makes the code single-use.
+// The friend code is always on: it replaces the raw account in the profile card.
+// It always carries a live token (the account alone is no longer addable), Copy
+// and QR (the shared #copy-account / #show-qr handlers, reading #account.dataset
+// .full and /api/qr) act on it, "New code" refreshes it, and the toggle chooses
+// whether it auto-renews after each use or stays reusable until a manual refresh.
+function renderInviteCode(b) {
+  renderFriendCode($("account"), b.code || ""); // code takes the account's place
+  $("onetime-switch").selected = !!b.auto_refresh;
+  $("onetime-state").textContent = b.auto_refresh
+    ? "On — each code works once, then a fresh one appears"
+    : "Off — this code can be shared and reused";
+}
+// While a toggle/refresh POST is outstanding, the background poll must not
+// GET and re-render the pre-action state — that snaps the switch back for a
+// frame until the POST lands. loadInviteCode() (the poll caller) skips itself
+// while this is set; inviteCodeAction owns the render during its own window.
+let inviteActionInFlight = false;
+async function loadInviteCode() {
+  if (!$("onetime-switch") || inviteActionInFlight) return;
+  const { ok, body } = await api("/api/invite-code");
+  if (ok) renderInviteCode(body);
+}
+async function inviteCodeAction(action) {
+  inviteActionInFlight = true;
+  let ok, body;
+  try {
+    ({ ok, body } = await api("/api/invite-code", { method: "POST", body: JSON.stringify({ action }) }));
+  } finally {
+    inviteActionInFlight = false;
+  }
+  if (ok) renderInviteCode(body);
+  else await loadInviteCode(); // resync the switch/code to the real state on failure
+}
+$("onetime-switch").addEventListener("change", (e) => inviteCodeAction(e.target.selected ? "enable" : "disable"));
+$("onetime-refresh").addEventListener("click", () => inviteCodeAction("refresh"));
+
 // renderNotice shows a one-time message from the desktop shell. It is raised
 // while the window is hidden, so it waits here until the window is looked at.
 function renderNotice(text) {
@@ -2392,6 +3234,10 @@ let pendingPassword = null;
 // signup, then wiped by clearOnboardingSecrets() on every exit (success,
 // or Escape).
 let pendingPhrase = null;
+// PIN chosen at the wizard's PIN step, held until "Start messaging" unlocks and
+// can actually enable it. Wiped by clearOnboardingSecrets() like the other two.
+// See the PIN step for why it cannot be enabled where it is entered.
+let wizPendingPin = null;
 
 // ---- password strength (advisory only; never blocks account creation) ----
 function pwScore(p) {
@@ -2499,6 +3345,7 @@ function validatePassword(pw) {
 function clearOnboardingSecrets() {
   pendingPassword = null;
   pendingPhrase = null;
+  wizPendingPin = null;
   if ($("phrase-text")) $("phrase-text").textContent = "";
 }
 // Paint the recovery phrase as a numbered grid so each word is easy to
@@ -2524,18 +3371,14 @@ $("phrase-copy").addEventListener("click", async () => {
   const text = pendingPhrase.trim().split(/\s+/).join(" ");
   try {
     await navigator.clipboard.writeText(text);
-    const btn = $("phrase-copy");
-    btn.textContent = "Copied!";
-    setTimeout(() => { btn.textContent = "Copy"; }, 2000);
+    showToast("Recovery phrase copied");
   } catch {
     // Fallback for non-HTTPS contexts.
     const ta = document.createElement("textarea");
     ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
     document.body.appendChild(ta); ta.select();
     document.execCommand("copy"); document.body.removeChild(ta);
-    const btn = $("phrase-copy");
-    btn.textContent = "Copied!";
-    setTimeout(() => { btn.textContent = "Copy"; }, 2000);
+    showToast("Recovery phrase copied");
   }
 });
 
@@ -2585,14 +3428,24 @@ $("phrase-download").addEventListener("click", async () => {
 // succeeds the app boots to the lock screen instead, and the phrase — the one
 // thing that used to be lost — is now viewable any time under You › Security.
 const WIZ_NUMBERED = ["privacy", "password", "profile", "phrase", "contacts", "security", "notify", "pin"];
-// Explainer panels carry the shared Back/Next footer; action steps and
-// welcome/done own their own buttons.
+// Every step declares Back/Next. Steps whose primary action lives in the panel
+// itself (password → Create account, profile → Continue, phrase → I've saved it)
+// set next:null so the shared footer shows only Back — one consistent Back
+// position across the whole flow. contacts keeps back:null: it renders after the
+// account exists and must not walk the user back into the password step.
 const WIZ_FLOW = {
-  privacy:  { back: "welcome",  next: "password" },
-  contacts: { back: null,       next: "security" }, // no going back past account creation
+  // welcome/done intentionally absent: they own their CTAs and must not show
+  // the shared Back/Next footer.
+  privacy:  { back: "welcome", next: "password" },
+  password: { back: "privacy", next: null },
+  profile:  { back: "password", next: null },
+  phrase:   { back: "profile", next: null },
+  contacts: { back: null,      next: "security" }, // no going back past account creation
   security: { back: "contacts", next: "notify" },
   notify:   { back: "security", next: "pin" },
   pin:      { back: "notify",   next: "done" },
+  recover:  { back: "welcome",  next: null },
+  link:     { back: "welcome",  next: null },
 };
 // Only pre-account steps are worth persisting: past "password" the account
 // exists and onboarding never renders again (the app opens locked instead).
@@ -2619,7 +3472,9 @@ function wizRenderProgress(step) {
 }
 
 // Move to a step: show its panel, update the progress row and the Back/Next
-// footer, and remember the spot (pre-account only).
+// footer, move focus to the new heading (so keyboard/screen-reader users land
+// on the step instead of a hidden button), and remember the spot (pre-account
+// only).
 function wizGoTo(step) {
   wizStep = step;
   document.querySelectorAll("#view-none .wiz-step").forEach(el => { el.hidden = true; });
@@ -2628,11 +3483,23 @@ function wizGoTo(step) {
   wizRenderProgress(step);
   const flow = WIZ_FLOW[step];
   $("wiz-nav").hidden = !flow;
-  if (flow) { $("wiz-back").style.visibility = flow.back ? "visible" : "hidden"; }
+  if (flow) {
+    $("wiz-back").style.visibility = flow.back ? "visible" : "hidden";
+    $("wiz-next").hidden = !flow.next;
+  }
   try {
     if (WIZ_RESUMABLE.has(step)) localStorage.setItem(WIZ_KEY, step);
     else localStorage.removeItem(WIZ_KEY);
   } catch (_) {}
+  // Focus the step heading (tabindex=-1 set in markup where needed) so focus
+  // isn't stranded on a button inside a now-hidden panel.
+  if (panel) {
+    const h = panel.querySelector("h1, h2");
+    if (h) {
+      if (!h.hasAttribute("tabindex")) h.setAttribute("tabindex", "-1");
+      setTimeout(() => { try { h.focus(); } catch (_) {} }, 0);
+    }
+  }
 }
 
 // Entry point when onboarding is shown: resume the last pre-account step, or
@@ -2653,9 +3520,6 @@ $("wiz-back").addEventListener("click", () => { const b = WIZ_FLOW[wizStep]?.bac
 $("wiz-start-create").addEventListener("click", () => wizGoTo("privacy"));
 $("wiz-start-recover").addEventListener("click", () => { wizGoTo("recover"); $("recover-mnemonic").focus(); });
 $("wiz-start-link").addEventListener("click", () => { wizGoTo("link"); $("wiz-link-code").focus(); });
-// Back out of a branch to the welcome step.
-$("to-create").addEventListener("click", () => wizGoTo("welcome"));
-$("to-create-from-link").addEventListener("click", () => wizGoTo("welcome"));
 
 // ---------- wizard: profile step (display name + avatar) ----------
 // Runs after account creation. POSTs to /api/profile which already supports
@@ -2673,11 +3537,12 @@ $("wiz-avatar-input").addEventListener("change", async (e) => {
   if (!file) return;
   const err = $("wiz-avatar-error"); err.hidden = true;
   try {
-    const b64 = await blobToBase64(await processAvatar(file));
-    wizPendingAvatar = b64;
-    // Show a preview: create a temporary object URL from the processed blob.
-    const blob = await (await fetch("data:image/jpeg;base64," + b64)).blob();
-    const url = URL.createObjectURL(blob);
+    const cropped = await openAvatarCropper(file);
+    if (!cropped) return; // cancelled in the crop editor
+    wizPendingAvatar = await blobToBase64(cropped);
+    // Preview straight off the cropped blob — the old code round-tripped the
+    // base64 back through fetch() to rebuild a blob it already had.
+    const url = URL.createObjectURL(cropped);
     const box = $("wiz-my-avatar");
     box.innerHTML = "";
     const img = document.createElement("img"); img.src = url; img.alt = "Profile picture";
@@ -2710,31 +3575,92 @@ $("wiz-profile-next").addEventListener("click", async () => {
 });
 
 // ---------- wizard: PIN step ----------
-// Replaces the old post-unlock modal. Same backend call (POST /api/security
-// with action "pin-enable"), same password reuse from the onboarding session.
-$("wiz-pin-save").addEventListener("click", async () => {
+// Replaces the old post-unlock modal, but it CANNOT enable the PIN where the
+// user types it: POST /api/security is s.auth()-gated on a vault session token,
+// and no session exists anywhere in the wizard. The only place setSessionToken()
+// is called for a fresh signup is doUnlock(), which runs at "Start messaging" —
+// i.e. after this step. Posting from here therefore always 401'd, and because
+// auth() answers with plain text rather than JSON there was not even a server
+// message to show: every user who chose a PIN during onboarding got the generic
+// "Could not turn on PIN unlock." (ui-audit frame 13c).
+//
+// So this step validates and holds the PIN, and wiz-finish enables it once the
+// unlock has minted a session. Deferring beats minting a session here: a live
+// token mid-wizard makes refresh() take its `sessionToken && unlocked` branch
+// and drop the user straight into the chat view on the next WebView rebuild,
+// skipping the rest of onboarding — and it would start the onion service three
+// steps earlier, moving publish timing for no user-visible gain.
+//
+// Validation stays client-side and immediate, which is all this step can
+// honestly check: the label promises "6+ digits", and an empty pair used to fire
+// a raw server error at the user.
+$("wiz-pin-save").addEventListener("click", () => {
   const err = $("wiz-pin-error"); err.hidden = true;
-  const code = $("wiz-pin-new").value;
-  if (code !== $("wiz-pin-confirm").value) { err.textContent = "The two PINs don't match."; err.hidden = false; return; }
-  if (!pendingPassword) { wizGoTo("done"); return; }
-  const { ok, body } = await api("/api/security", { method: "POST", body: JSON.stringify({ action: "pin-enable", password: pendingPassword, code }) });
-  if (!ok) { err.textContent = body.error || "Could not turn on PIN unlock."; err.hidden = false; return; }
-  pinEnabled = true;
-  if (typeof renderPinState === "function") renderPinState();
+  const code = ($("wiz-pin-new").value || "").trim();
+  const code2 = ($("wiz-pin-confirm").value || "").trim();
+  if (!/^\d{6,}$/.test(code)) {
+    err.textContent = "Enter a PIN of at least 6 digits.";
+    err.hidden = false; $("wiz-pin-new").focus(); return;
+  }
+  if (code !== code2) { err.textContent = "The two PINs don't match."; err.hidden = false; return; }
+  wizPendingPin = code;
   $("wiz-pin-new").value = ""; $("wiz-pin-confirm").value = "";
   wizGoTo("done");
 });
 $("wiz-pin-skip").addEventListener("click", () => {
+  wizPendingPin = null;
   $("wiz-pin-new").value = ""; $("wiz-pin-confirm").value = "";
   $("wiz-pin-error").hidden = true;
   wizGoTo("done");
 });
 
-// Finish: unlock into the app. PIN is already handled in the wizard now.
+// Notify step: the explainer's whole subject is notifications, so it gets the
+// button that actually requests permission — not just "go find the switch".
+$("wiz-notify-enable")?.addEventListener("click", async () => {
+  if (isAndroid) {
+    // The shell posts natively; there is no web permission to ask. Point at
+    // the system settings instead of silently doing nothing.
+    showToast("Notifications are managed in Android settings");
+    return;
+  }
+  if (!("Notification" in window)) { showToast("Notifications aren't supported here"); return; }
+  let perm = Notification.permission;
+  if (perm === "default") { try { perm = await Notification.requestPermission(); } catch (_) { perm = "denied"; } }
+  if (perm === "granted") {
+    notifsOn = true;
+    try { localStorage.setItem("notifs", "1"); } catch (_) {}
+    $("notif-switch").selected = true;
+    $("notif-state").textContent = "On — alerts for new messages";
+    showToast("Notifications are on");
+  } else {
+    showToast("Notifications stay off — you can enable them in settings");
+  }
+});
+
+// Finish: unlock into the app, then apply the PIN the wizard collected. This is
+// the first moment a session token exists, so it is the first moment
+// POST /api/security can succeed (see the PIN step).
 $("wiz-finish").addEventListener("click", async () => {
   const pw = pendingPassword;
+  const pin = wizPendingPin;
   clearOnboardingSecrets();
-  if (pw) await doUnlock(pw);
+  if (!pw) return;
+  const unlocked = await doUnlock(pw);
+  if (!unlocked?.ok || !pin) return;
+  // The password that just unlocked is the one pinEnable re-verifies, so this
+  // only fails on a genuine backend fault. The user is already in the app by
+  // now, so report it where they are and name the place it can be retried —
+  // never silently leave a PIN they asked for turned off.
+  const { ok, body } = await api("/api/security", {
+    method: "POST",
+    body: JSON.stringify({ action: "pin-enable", password: pw, code: pin }),
+  });
+  if (!ok) {
+    showToast(body.error || "PIN unlock couldn't be turned on — set it in You › Security");
+    return;
+  }
+  pinEnabled = true;
+  if (typeof renderPinState === "function") renderPinState();
 });
 $("link-password").addEventListener("input", (e) => {
   const p = e.target.value || "";
@@ -2767,7 +3693,7 @@ $("link-form").addEventListener("submit", async (e) => {
     $("link-btn").disabled = false; $("link-btn").textContent = "Link this device";
     if (!res.ok) { err.textContent = res.body.error || "Could not link device."; err.hidden = false; return; }
     // Success — store the session token and transition to chat.
-    sessionToken = res.body.session_token;
+    setSessionToken(res.body.session_token);
     $("link-form").hidden = true;
     await showUnlocked();
   } catch (_) {
@@ -2915,9 +3841,6 @@ $("recover-btn").addEventListener("click", (e) => {
 
 // ---------- optional PIN step during onboarding ----------
 // Shown once, right after the first unlock of a new or recovered account (a PIN
-// can only be set from an unlocked session, so it can't go earlier). The
-// onboarding password is held only for the life of this modal so the user need
-// not retype it, then dropped. Skipping is a first-class choice — a PIN is just
 // ---------- events: profile / share ----------
 $("edit-name-btn").addEventListener("click", async () => {
   const result = await editDialog({
@@ -2928,13 +3851,18 @@ $("edit-name-btn").addEventListener("click", async () => {
   if (!result) return;
   const name = result.name.trim();
   const { ok, body } = await api("/api/profile", { method: "POST", body: JSON.stringify({ display_name: name }) });
-  if (!ok) return;
+  if (!ok) { showToast(body.error || "Couldn't change your name."); return; }
   myName = body.display_name || name;
   $("display-name-text").textContent = myName || "(not set)";
   renderMyAvatar();
 });
-// Profile picture: pick → client crop/downscale → POST base64 to /api/profile.
-$("avatar-btn").addEventListener("click", () => $("avatar-input").click());
+// Profile picture. With one set, the button OPENS it fullscreen (kind:"avatar"),
+// where Edit and Remove live; with none, it goes straight to the file picker.
+// Picking always routes through the crop editor before the upload.
+$("avatar-btn").addEventListener("click", () => {
+  if (myAvatarHash) openMyAvatarViewer();
+  else $("avatar-input").click();
+});
 $("avatar-input").addEventListener("change", async (e) => {
   const file = e.target.files && e.target.files[0];
   e.target.value = ""; // allow re-picking the same file
@@ -2942,7 +3870,9 @@ $("avatar-input").addEventListener("change", async (e) => {
   const err = $("avatar-error"); err.hidden = true;
   const btn = $("avatar-btn"); btn.setAttribute("disabled", "");
   try {
-    const b64 = await blobToBase64(await processAvatar(file));
+    const blob = await openAvatarCropper(file);
+    if (!blob) return; // cancelled — keep whatever picture was already set
+    const b64 = await blobToBase64(blob);
     const { ok, body } = await api("/api/profile", { method: "POST", body: JSON.stringify({ avatar: b64 }) });
     if (!ok) { err.textContent = (body && body.error) || "Couldn't set that picture."; err.hidden = false; return; }
     myAvatarHash = body.avatar_hash || "";
@@ -2954,12 +3884,33 @@ $("avatar-input").addEventListener("change", async (e) => {
     btn.removeAttribute("disabled");
   }
 });
-$("avatar-remove-btn").addEventListener("click", async () => {
+
+// openMyAvatarViewer shows my own picture fullscreen. It fetches through api()
+// rather than pointing the <img> at /api/avatar directly because that endpoint
+// is authenticated — a bare src would 401.
+async function openMyAvatarViewer() {
+  if (!myAvatarHash) return;
+  const url = await avatarObjectURL(myAvatarHash);
+  if (!url) { showToast("Couldn't load that picture."); return; }
+  openImageViewer(url, { kind: "avatar" });
+}
+$("image-viewer-avatar-edit").addEventListener("click", () => {
+  closeImageViewer();
+  $("avatar-input").click();
+});
+$("image-viewer-avatar-remove").addEventListener("click", async () => {
+  if (!(await confirmDialog({
+    title: "Remove profile picture?",
+    message: "People who already have it keep the copy they downloaded.",
+    confirmLabel: "Remove",
+    danger: true,
+  }))) return;
   const { ok, body } = await api("/api/profile", { method: "POST", body: JSON.stringify({ avatar: "" }) });
-  if (!ok) return;
+  if (!ok) { showToast((body && body.error) || "Couldn't remove that picture."); return; }
   myAvatarHash = body.avatar_hash || "";
   renderMyAvatar();
-});
+  closeImageViewer();
+}); 
 // Mailbox settings.
 $("edit-mailbox-btn").addEventListener("click", async () => {
   const result = await editDialog({
@@ -2970,7 +3921,7 @@ $("edit-mailbox-btn").addEventListener("click", async () => {
   if (!result) return;
   const url = result.mailbox.trim();
   const { ok, body } = await api("/api/profile", { method: "POST", body: JSON.stringify({ mailbox_url: url }) });
-  if (!ok) return;
+  if (!ok) { showToast(body.error || "Couldn't save the mailbox."); return; }
   myMailbox = body.mailbox_url || "";
   $("mailbox-state").textContent = myMailbox ? myMailbox : "Not set — messages only arrive when you're online";
 });
@@ -2988,9 +3939,11 @@ $("edit-gib-btn").addEventListener("click", async () => {
   if (!Number.isFinite(mb) || mb < 0) return;
   const bytes = Math.round(mb) * MB;
   const { ok, body } = await api("/api/profile", { method: "POST", body: JSON.stringify({ group_image_backup_bytes: bytes }) });
-  if (!ok) return;
+  if (!ok) { showToast(body.error || "Couldn't change group image backup."); return; }
   myBackupBytes = body.group_image_backup_bytes || 0;
+  myMediaAutoSave = !!body.media_auto_save;
   renderBackupState();
+  syncMediaSaveSection();
 });
 $("gib-restore-btn").addEventListener("click", async () => {
   const st = $("gib-restore-state");
@@ -3032,6 +3985,7 @@ $("link-new-btn").addEventListener("click", async () => {
 $("link-new-done").addEventListener("click", () => { $("link-new-box").hidden = true; });
 $("link-copy").addEventListener("click", async () => {
   try { await navigator.clipboard.writeText($("link-code").textContent.trim()); } catch (_) {}
+  showToast("Pairing code copied");
 });
 $("link-existing-btn").addEventListener("click", () => {
   $("link-new-box").hidden = true;
@@ -3064,7 +4018,7 @@ $("copy-account").addEventListener("click", async () => {
   const full = $("account").dataset.full || "";
   if (!full) return;
   try { await navigator.clipboard.writeText(full); } catch (_) {}
-  const fb = $("copy-feedback"); fb.hidden = false; setTimeout(() => { fb.hidden = true; }, 1500);
+  showToast("Friend code copied");
 });
 $("show-qr").addEventListener("click", async () => {
   // Open fullscreen QR viewer directly
@@ -3106,15 +4060,23 @@ $("find-account").addEventListener("input", () => {
   const val = $("find-account").value.trim();
   const preview = $("find-preview");
   const helpText = $("find-help-text");
-  // Show preview when input looks like a valid onion address (ends with .onion, min 16 chars)
-  if (val.length >= 16 && val.endsWith(".onion")) {
+  // Show a preview once the input looks like something we can add: an onion
+  // address, or a friend code (mp1:<account>:<token>) whose middle segment is
+  // the account. The seed for the initials avatar is that bare account.
+  let seed = "";
+  if (val.startsWith("mp1:")) {
+    seed = val.split(":")[1] || "";
+  } else if (val.length >= 16 && val.endsWith(".onion")) {
+    seed = val;
+  }
+  if (seed.length >= 16) {
     preview.hidden = false;
     helpText.hidden = true;
-    $("find-preview-name").textContent = val.slice(0, 16) + "…";
+    $("find-preview-name").textContent = seed.slice(0, 16) + "…";
     // Render initials avatar
     const av = $("find-preview-avatar");
     av.innerHTML = "";
-    av.append(avatarNode("", val, null));
+    av.append(avatarNode("", seed, null));
   } else {
     preview.hidden = true;
     helpText.hidden = false;
@@ -3125,10 +4087,23 @@ $("find-form").addEventListener("submit", async (e) => {
   const err = $("find-error"); err.hidden = true; $("find-result").hidden = true; lookupResult = null;
   const account = $("find-account").value.trim();
   const btn = $("find-btn"); btn.disabled = true; btn.textContent = "Looking up…";
-  const { ok, body } = await api("/api/lookup", { method: "POST", body: JSON.stringify({ account }) });
+  const prog = $("find-progress"); if (prog) prog.hidden = false;
+  const hint = $("find-hint"); if (hint) hint.hidden = false;
+  let ok, body;
+  try {
+    ({ ok, body } = await api("/api/lookup", { method: "POST", body: JSON.stringify({ account }) }));
+  } catch (_) {
+    ok = false; body = { error: "Could not reach the server. Try again?" };
+  }
   btn.disabled = false; btn.textContent = "Look up";
+  if (prog) prog.hidden = true;
+  if (hint) hint.hidden = true;
   if (!ok) { err.textContent = body.error || "Could not find that account."; err.hidden = false; return; }
-  lookupResult = { account: body.account, display_name: body.display_name || "", avatar_hash: body.avatar_hash || "" };
+  // Keep the raw typed value (a bare account, or a one-time invite code
+  // mp1:<account>:<token>) as `code`: the send step posts that so the token
+  // survives to the backend, which re-parses it. `account` is the canonical
+  // bare account the peer returned, used only for display.
+  lookupResult = { code: account, account: body.account, display_name: body.display_name || "", avatar_hash: body.avatar_hash || "" };
   $("find-name").textContent = lookupResult.display_name || "(no display name)";
   $("find-short").textContent = "· " + shortAccount(lookupResult.account);
   // The face at add-time: the backend fetched and cached the bytes during lookup,
@@ -3141,7 +4116,12 @@ $("find-form").addEventListener("submit", async (e) => {
 $("send-request-btn").addEventListener("click", async () => {
   if (!lookupResult) return;
   const btn = $("send-request-btn"); btn.disabled = true; btn.textContent = "Sending…";
-  const { ok, body } = await api("/api/friend-requests/send", { method: "POST", body: JSON.stringify({ account: lookupResult.account, name: lookupResult.display_name }) });
+  let ok, body;
+  try {
+    ({ ok, body } = await api("/api/friend-requests/send", { method: "POST", body: JSON.stringify({ account: lookupResult.code, name: lookupResult.display_name }) }));
+  } catch (_) {
+    ok = false; body = { error: "Could not reach the server. Try again?" };
+  }
   btn.disabled = false; btn.textContent = "Send friend request";
   if (!ok) { $("find-error").textContent = body.error || "Could not send request."; $("find-error").hidden = false; return; }
   lookupResult = null;
@@ -3151,6 +4131,7 @@ $("send-request-btn").addEventListener("click", async () => {
 $("requests-list").addEventListener("click", async (e) => {
   const acc = e.target.closest("[data-accept]"), dec = e.target.closest("[data-decline]");
   if (acc) {
+    acc.setAttribute("disabled", "");
     const { ok, body } = await api("/api/friend-requests/accept", { method: "POST", body: JSON.stringify({ account: acc.dataset.accept }) });
     // Don't imply it's done when the other side hasn't heard. We keep retrying
     // in the background, but they stay stuck at "pending" until it lands.
@@ -3160,7 +4141,10 @@ $("requests-list").addEventListener("click", async (e) => {
       n.hidden = false;
       setTimeout(() => { n.hidden = true; }, 12000);
     }
-  } else if (dec) await api("/api/friend-requests/decline", { method: "POST", body: JSON.stringify({ account: dec.dataset.decline }) });
+  } else if (dec) {
+    dec.setAttribute("disabled", "");
+    await api("/api/friend-requests/decline", { method: "POST", body: JSON.stringify({ account: dec.dataset.decline }) });
+  }
   else return;
   await Promise.all([loadRequests(), loadContacts()]);
 });
@@ -3244,7 +4228,9 @@ function renderGroupInfo() {
     const actions = document.createElement("div"); actions.className = "member-actions";
     if (!m.is_self) {
       if (m.friend_status === "accepted") { const b = document.createElement("md-text-button"); b.textContent = "Message"; b.dataset.gmsg = m.account; actions.append(b); }
-      else if (m.friend_status === "none") { const b = document.createElement("md-text-button"); b.textContent = "Add friend"; b.dataset.gfriend = m.account; b.dataset.gname = m.name || ""; actions.append(b); }
+      // No "Add friend" for a co-member: the account alone is no longer addable —
+      // adding someone now requires their current friend code, which you only have
+      // if they shared it with you out of band.
       else if (m.friend_status === "pending_out") { const s = document.createElement("span"); s.className = "label muted"; s.textContent = "Requested"; actions.append(s); }
       else if (m.friend_status === "pending_in") { const b = document.createElement("md-text-button"); b.textContent = "Accept friend"; b.dataset.gacceptfriend = m.account; actions.append(b); }
       if (isAdmin) {
@@ -3282,9 +4268,9 @@ function renderGroupInviteContacts() {
   for (const c of invitable) {
     const row = document.createElement("div"); row.className = "member-row";
     const info = document.createElement("div"); info.className = "member-id";
-    info.append(avatarNode(c.avatar_hash, c.name || shortAccount(c.account), null));
+    info.append(avatarNode(c.avatar_hash, contactLabel(c), null));
     const nm = document.createElement("div"); nm.className = "body";
-    nm.textContent = c.name || shortAccount(c.account);
+    nm.textContent = contactLabel(c);
     info.append(nm);
     const actions = document.createElement("div"); actions.className = "member-actions";
     if (groupInvitedThisSession.has(sentInviteKey(currentGroup, c.account))) {
@@ -3328,12 +4314,11 @@ async function groupAction(path, payload) {
   return true;
 }
 $("group-members-list").addEventListener("click", async (e) => {
-  const t = e.target.closest("[data-gmsg],[data-gfriend],[data-gacceptfriend],[data-gpromote],[data-gremove]");
+  const t = e.target.closest("[data-gmsg],[data-gacceptfriend],[data-gpromote],[data-gremove]");
   if (!t) return;
   if (t.dataset.gmsg) { setTab("chats"); openChat(t.dataset.gmsg); return; }
   t.setAttribute("disabled", "");
-  if (t.dataset.gfriend) { await groupAction("/api/friend-requests/send", { account: t.dataset.gfriend, name: t.dataset.gname }); }
-  else if (t.dataset.gacceptfriend) { await groupAction("/api/friend-requests/accept", { account: t.dataset.gacceptfriend }); await loadRequests(); }
+  if (t.dataset.gacceptfriend) { await groupAction("/api/friend-requests/accept", { account: t.dataset.gacceptfriend }); await loadRequests(); }
   else if (t.dataset.gpromote) { await groupAction("/api/groups/promote", { group: currentGroup, account: t.dataset.gpromote }); }
   else if (t.dataset.gremove) { await groupAction("/api/groups/remove", { group: currentGroup, account: t.dataset.gremove }); }
   await Promise.all([loadGroupMembers(), loadContacts()]);
@@ -3453,7 +4438,7 @@ function openRelayOffer(id, peer) {
     item.setAttribute("role", "radio");
     item.setAttribute("aria-checked", String(h.account === relayOfferHolder));
     const radio = document.createElement("span"); radio.className = "radio";
-    const label = document.createElement("span"); label.textContent = h.name || h.account;
+    const label = document.createElement("span"); label.textContent = contactLabel(h, h.account);
     item.append(radio, label);
     list.append(item);
   }
@@ -3559,10 +4544,10 @@ $("scan-cancel").addEventListener("click", closeScan);
 // re-fetch or leak object URLs.
 const imageURLs = new Map();
 
-function imageElement(id) {
+function imageElement(id, delivery) {
   const img = document.createElement("img");
   img.className = "msg-image";
-  img.alt = "Photo";
+  img.alt = delivery === "failed" ? "Photo, not sent" : "Photo";
   const cached = imageURLs.get(id);
   if (cached) {
     img.src = cached;
@@ -3570,7 +4555,11 @@ function imageElement(id) {
     img.classList.add("skeleton");
     fetchImage(id, img);
   }
-  img.addEventListener("click", () => { if (img.src && !img.classList.contains("img-missing") && !img.classList.contains("skeleton")) openImageViewer(img.src); });
+  img.addEventListener("click", () => {
+    if (img.src && !img.classList.contains("img-missing") && !img.classList.contains("skeleton")) {
+      openImageViewer(img.src, { delivery });
+    }
+  });
   return img;
 }
 
@@ -3637,6 +4626,7 @@ function groupImageElement(m) {
 // ---- fullscreen image viewer: zoom / pan / download / forward (item 2) ----
 let ivSrc = null;                 // the currently-shown image's object URL
 let ivIsQR = false;               // true when the viewer holds a QR (no save/forward)
+let ivIsAvatar = false;           // true when the viewer holds MY profile picture
 const ivZoom = { scale: 1, tx: 0, ty: 0 }; // applied transform
 const ivPointers = new Map();     // active pointers on the stage (pinch tracking)
 let ivPinchStart = null;          // {dist, scale, cx, cy} captured when the 2nd finger lands
@@ -3653,23 +4643,49 @@ function ivReset() {
   ivApply();
 }
 // opts.kind === "qr" opens the viewer for a QR code: no gallery-save or forward
-// (a QR isn't a photo), just fullscreen + zoom. Visibility is set on EVERY open so
-// a prior QR view never leaves the actions hidden for the next photo.
+// (a QR isn't a photo), just fullscreen + zoom. opts.kind === "avatar" opens MY
+// profile picture: the photo actions step aside for Edit and Remove, since
+// saving your own avatar to your gallery or forwarding it is not the point. opts.delivery === "failed" marks
+// an undelivered outgoing image: a persistent "Not sent" chip appears and the
+// share/forward/download actions step aside — the viewer must never imply the
+// message went out. Visibility is set on EVERY open so a prior QR/failed view
+// never leaks into the next photo.
+let ivHintShown = false;
 function openImageViewer(src, opts = {}) {
   const isQR = opts.kind === "qr";
+  const isAvatar = opts.kind === "avatar";
+  const notSent = opts.delivery === "failed";
   ivSrc = src;
   ivIsQR = isQR;
+  ivIsAvatar = isAvatar;
   $("image-viewer-img").src = src;
-  $("image-viewer-img").alt = isQR ? "QR code" : "Photo";
-  $("image-viewer-actions").hidden = isQR;
+  $("image-viewer-img").alt = isQR ? "QR code" : (isAvatar ? "Your profile picture" : (notSent ? "Photo, not sent" : "Photo"));
+  $("image-viewer-actions").hidden = isQR || isAvatar || notSent;
+  $("image-viewer-avatar-actions").hidden = !isAvatar;
+  const state = $("image-viewer-state");
+  if (state) state.hidden = !notSent;
   ivReset();
-  ivNote(null);
-  $("bottomnav").hidden = true;
+  ivNote(ivHintShown || isQR ? null : "Double-tap to zoom");
+  ivHintShown = true;
+  // Mirror showDetail's nav rule: the bar hides only in the narrow overlay
+  // layout — an unconditional hide/show resurrected it wrongly on wide.
+  const isWide = window.matchMedia("(min-width: 900px)").matches;
+  $("bottomnav").hidden = !isWide ? true : $("bottomnav").hidden;
   $("image-viewer").hidden = false;
+  // Focus the close control so keyboard/switch users land inside the overlay.
+  setTimeout(() => { try { $("image-viewer-close").focus(); } catch (_) {} }, 0);
 }
 function closeImageViewer() {
   $("image-viewer").hidden = true;
-  $("bottomnav").hidden = false;
+  clearTimeout(ivNoteTimer);
+  // Restore the nav exactly as showDetail would: visible unless a detail pane
+  // is overlaying the list on a narrow layout.
+  const isWide = window.matchMedia("(min-width: 900px)").matches;
+  $("bottomnav").hidden = detailContent !== null && !isWide;
+  const state = $("image-viewer-state");
+  if (state) state.hidden = true;
+  ivIsAvatar = false;
+  $("image-viewer-avatar-actions").hidden = true;
   $("image-viewer-img").removeAttribute("src");
   $("image-viewer-img").style.transform = "";
   ivSrc = null;
@@ -3682,6 +4698,34 @@ function ivNote(text) {
 
 // Zoom around a stage-space point (px,py), clamped to [1, 5]. At scale 1 we
 // recentre (tx/ty = 0) so the image can't drift off after zooming back out.
+// A brief zoom-level pill (reusing .iv-note) surfaces the change — without it
+// a "stuck" pinch at the 5× cap reads as a bug.
+let ivNoteTimer = null;
+function ivShowZoom() {
+  if (ivIsQR) return;
+  clearTimeout(ivNoteTimer);
+  ivNote(Math.round(ivZoom.scale * 100) + "%");
+  ivNoteTimer = setTimeout(() => ivNote(null), 1200);
+}
+// ivLocalPoint converts a client-space point (a finger, a pinch centroid, the
+// mouse) into the image's own transform space.
+//
+// ivZoomTo's anchor maths requires the point to be measured from the SAME origin
+// the scale happens about. #image-viewer-img sets transform-origin: 0 0 — the
+// IMAGE element's top-left — but every caller was passing a point measured from
+// the STAGE's top-left. The stage flex-centres the image, so the two differ by
+// the letterbox margin, and each zoom was displaced by exactly that: a double-tap
+// right of centre zoomed to a point left of the finger, and the error grew with
+// the gap between the image box and the stage (worst for a portrait photo on a
+// landscape screen).
+//
+// With origin 0 0 the transformed rect's top-left is just the untransformed
+// top-left plus the current translation, so subtracting tx/ty recovers the layout
+// origin exactly — no need to measure the letterbox.
+function ivLocalPoint(clientX, clientY) {
+  const r = $("image-viewer-img").getBoundingClientRect();
+  return { x: clientX - (r.left - ivZoom.tx), y: clientY - (r.top - ivZoom.ty) };
+}
 function ivZoomTo(newScale, px, py) {
   newScale = Math.max(1, Math.min(5, newScale));
   const k = newScale / ivZoom.scale;
@@ -3713,9 +4757,8 @@ ivStage.addEventListener("pointermove", (e) => {
   if (ivPointers.size === 2 && ivPinchStart) {
     const [a, b] = [...ivPointers.values()];
     const dist = Math.hypot(a.x - b.x, a.y - b.y);
-    const rect = ivStage.getBoundingClientRect();
-    ivZoomTo(ivPinchStart.scale * (dist / ivPinchStart.dist),
-      ivPinchStart.cx - rect.left, ivPinchStart.cy - rect.top);
+    const anchor = ivLocalPoint(ivPinchStart.cx, ivPinchStart.cy);
+    ivZoomTo(ivPinchStart.scale * (dist / ivPinchStart.dist), anchor.x, anchor.y);
   } else if (ivPointers.size === 1 && ivZoom.scale > 1) {
     ivZoom.tx += p.x - prev.x; ivZoom.ty += p.y - prev.y;
     ivApply();
@@ -3730,12 +4773,15 @@ function ivPointerEnd(e) {
     if (!ivMultiTouched) {
       const now = Date.now();
       if (now - ivLastTap < 300) {
-        const rect = ivStage.getBoundingClientRect();
-        ivZoomTo(ivZoom.scale > 1 ? 1 : 2.5, e.clientX - rect.left, e.clientY - rect.top);
+        const anchor = ivLocalPoint(e.clientX, e.clientY);
+        ivZoomTo(ivZoom.scale > 1 ? 1 : 2.5, anchor.x, anchor.y);
+        ivShowZoom();
         ivLastTap = 0;
       } else {
         ivLastTap = now;
       }
+    } else {
+      ivShowZoom(); // pinch just ended — surface the landing zoom level once
     }
     ivMultiTouched = false;
   }
@@ -3745,8 +4791,9 @@ ivStage.addEventListener("pointercancel", ivPointerEnd);
 // Desktop wheel zoom.
 ivStage.addEventListener("wheel", (e) => {
   e.preventDefault();
-  const rect = ivStage.getBoundingClientRect();
-  ivZoomTo(ivZoom.scale * (e.deltaY < 0 ? 1.15 : 0.87), e.clientX - rect.left, e.clientY - rect.top);
+  const anchor = ivLocalPoint(e.clientX, e.clientY);
+  ivZoomTo(ivZoom.scale * (e.deltaY < 0 ? 1.15 : 0.87), anchor.x, anchor.y);
+  ivShowZoom();
 }, { passive: false });
 // Close only from the backdrop (the stage itself, at fit) or the ✕ — never from
 // a tap on the image or a control, so zoom/pan and the buttons stay usable.
@@ -4166,8 +5213,6 @@ function closeMsgMenu(keepSel) {
   menuMsgId = null;
   menuAnchorRect = null;
   lpSwallowClick = false;
-  menuAnchorRect = null;
-  lpSwallowClick = false;
   if (!keepSel) {
     if (selectedBubbleRow) selectedBubbleRow.classList.remove("selected");
     selectedBubbleRow = null;
@@ -4296,67 +5341,208 @@ function forwardMessage(m) {
     openForwardPicker({ kind: "text", text: m.text });
   }
 }
-function openForwardPicker(payload) {
+// opts.title overrides the modal heading: the same picker serves "forward this
+// message" and "send this shared photo", and calling the second one Forward
+// would be a lie about where the photo came from.
+//
+// The picker is always a WhatsApp-style multi-select: tapping a chat ticks it
+// and Send dispatches to all of them at once. It used to also have a single-tap
+// mode that sent on the first tap; every caller wanted multi in the end, so the
+// second mode is gone rather than left as an unused branch.
+const forwardSelected = new Map(); // "type:id" -> target, in tap order
+function forwardKey(t) { return t.type + ":" + t.id; }
+
+function openForwardPicker(payload, opts = {}) {
   pendingForward = payload;
+  forwardSelected.clear();
+  $("forward-title").textContent = opts.title || "Forward to\u2026";
   const list = $("forward-list");
   list.innerHTML = "";
-  const add = (label, icon, onPick) => {
+  list.setAttribute("aria-multiselectable", "true");
+  const add = (label, icon, target) => {
     const b = document.createElement("button");
     b.type = "button"; b.className = "forward-item";
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
     svg.setAttribute("class", "icon");
     const use = document.createElementNS("http://www.w3.org/2000/svg", "use");
     use.setAttribute("href", icon); svg.append(use);
-    const span = document.createElement("span"); span.textContent = label;
+    const span = document.createElement("span"); span.className = "forward-label"; span.textContent = label;
     b.append(svg, span);
-    b.addEventListener("click", onPick);
+    // role=option + aria-selected is what makes the tick legible to a screen
+    // reader; the listbox above is marked aria-multiselectable to match.
+    b.setAttribute("role", "option");
+    b.setAttribute("aria-selected", "false");
+    const check = document.createElement("span");
+    check.className = "forward-check";
+    const csvg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    csvg.setAttribute("class", "icon");
+    const cuse = document.createElementNS("http://www.w3.org/2000/svg", "use");
+    cuse.setAttribute("href", "#ic-check"); csvg.append(cuse);
+    check.append(csvg);
+    b.append(check);
+    b.addEventListener("click", () => toggleForwardTarget(b, target));
     list.append(b);
   };
   for (const c of contacts.filter((c) => c.status === "accepted")) {
-    add(c.name || shortAccount(c.account), "#ic-person", () => doForward({ type: "contact", id: c.account }));
+    add(contactLabel(c), "#ic-person", { type: "contact", id: c.account });
   }
   for (const g of groups) {
-    add(g.name || "Group", "#ic-group", () => doForward({ type: "group", id: g.id }));
+    add(g.name || "Group", "#ic-group", { type: "group", id: g.id });
   }
   if (!list.children.length) {
-    const p = document.createElement("p"); p.className = "body muted"; p.textContent = "No chats to forward to yet.";
+    const p = document.createElement("p"); p.className = "body muted";
+    p.textContent = opts.title ? "No chats to send to yet." : "No chats to forward to yet.";
     list.append(p);
   }
+  updateForwardSend();
   $("forward-modal").hidden = false;
 }
-function closeForwardPicker() { $("forward-modal").hidden = true; pendingForward = null; }
+
+function toggleForwardTarget(btn, target) {
+  const k = forwardKey(target);
+  const on = !forwardSelected.has(k);
+  if (on) forwardSelected.set(k, target); else forwardSelected.delete(k);
+  btn.classList.toggle("selected", on);
+  btn.setAttribute("aria-selected", on ? "true" : "false");
+  updateForwardSend();
+}
+
+// The count goes in the button label so the number of recipients is visible
+// without counting ticks, and Send is dead until at least one is chosen.
+function updateForwardSend() {
+  const btn = $("forward-send");
+  if (!btn) return;
+  const n = forwardSelected.size;
+  btn.disabled = n === 0;
+  btn.textContent = n ? "Send to " + n : "Send";
+}
+
+function closeForwardPicker() {
+  $("forward-modal").hidden = true;
+  pendingForward = null;
+  forwardSelected.clear();
+}
 $("forward-cancel").addEventListener("click", closeForwardPicker);
+$("forward-send").addEventListener("click", () => doForward([...forwardSelected.values()]));
 $("forward-modal").addEventListener("click", (e) => { if (e.target === $("forward-modal")) closeForwardPicker(); });
 
-async function doForward(target) {
+// Sends the picked payload to every chosen chat. The expensive half — resizing
+// and JPEG-encoding the photo — is done ONCE and the identical bytes are posted
+// per recipient; doing it per target would re-encode the same image N times for
+// no difference in the result.
+async function doForward(targets) {
   const payload = pendingForward;
   closeForwardPicker();
-  if (!payload) return;
-  if (!torSendable) { $("send-error").textContent = "Still connecting to Tor — one moment, then you can forward."; $("send-error").hidden = false; return; }
+  if (!payload || !targets.length) return;
+  if (!torSendable) { forwardError("Still connecting to Tor — one moment, then you can send."); return; }
+
+  let forContacts = null, forGroups = null;
   try {
-    if (payload.kind === "text") {
-      if (target.type === "contact") await api("/api/messages", { method: "POST", body: JSON.stringify({ to: target.id, text: payload.text }) });
-      else await api("/api/groups/send", { method: "POST", body: JSON.stringify({ group: target.id, text: payload.text }) });
-    } else {
-      const blob = await (await fetch(payload.src)).blob();
-      if (target.type === "contact") {
-        const { blob: out, mime } = await processImage(blob);
-        const b64 = await blobToBase64(out);
-        await api("/api/messages/image", { method: "POST", body: JSON.stringify({ to: target.id, mime, data: b64 }) });
-      } else {
-        const { full, fullMime, thumb, thumbMime } = await processGroupImage(blob);
-        const [fullB64, thumbB64] = await Promise.all([blobToBase64(full), blobToBase64(thumb)]);
-        await api("/api/groups/image", { method: "POST", body: JSON.stringify({ group: target.id, full_mime: fullMime, full_data: fullB64, thumb_mime: thumbMime, thumb_data: thumbB64 }) });
-      }
+    const blob = payload.kind === "text" ? null : (payload.blob || await (await fetch(payload.src)).blob());
+    if (blob && targets.some((t) => t.type === "contact")) {
+      const { blob: out, mime } = await processImage(blob);
+      forContacts = { mime, data: await blobToBase64(out) };
     }
-    // Jump into the chat we forwarded to, so the sent copy is visible.
-    if (target.type === "contact") openChat(target.id); else openGroup(target.id);
-    await loadMessages();
+    // Groups need their own pair (full + thumbnail), so they get a second encode
+    // — but still only one, however many groups were ticked.
+    if (blob && targets.some((t) => t.type === "group")) {
+      const { full, fullMime, thumb, thumbMime } = await processGroupImage(blob);
+      const [fullB64, thumbB64] = await Promise.all([blobToBase64(full), blobToBase64(thumb)]);
+      forGroups = { full_mime: fullMime, full_data: fullB64, thumb_mime: thumbMime, thumb_data: thumbB64 };
+    }
   } catch (err) {
-    $("send-error").textContent = (err && err.message) || "Couldn't forward that.";
-    $("send-error").hidden = false;
+    forwardError((err && err.message) || "Couldn't send that.");
+    return;
   }
+
+  // Sequential, not Promise.all: each send dials a peer over Tor, and firing a
+  // dozen circuits at once is how you get timeouts rather than speed.
+  let sent = 0;
+  let lastError = "";
+  for (const t of targets) {
+    try {
+      let res;
+      if (payload.kind === "text") {
+        res = t.type === "contact"
+          ? await api("/api/messages", { method: "POST", body: JSON.stringify({ to: t.id, text: payload.text }) })
+          : await api("/api/groups/send", { method: "POST", body: JSON.stringify({ group: t.id, text: payload.text }) });
+      } else if (t.type === "contact") {
+        res = await api("/api/messages/image", { method: "POST", body: JSON.stringify(Object.assign({ to: t.id }, forContacts)) });
+      } else {
+        res = await api("/api/groups/image", { method: "POST", body: JSON.stringify(Object.assign({ group: t.id }, forGroups)) });
+      }
+      // api() resolves for a 4xx/5xx too, so an unchecked call would count a
+      // rejected send as delivered.
+      if (res && res.ok) sent++;
+      else lastError = (res && res.body && res.body.error) || lastError;
+    } catch (err) {
+      lastError = (err && err.message) || lastError;
+    }
+  }
+
+  const missed = targets.length - sent;
+  if (sent && !missed) {
+    // One recipient behaves like the single-tap flow: drop into the chat so the
+    // sent copy is visible. For several, there is no one chat to land in.
+    if (targets.length === 1) {
+      if (targets[0].type === "contact") openChat(targets[0].id); else openGroup(targets[0].id);
+    } else {
+      showToast("Sent to " + sent + " chats.");
+    }
+  } else if (sent) {
+    showToast("Sent to " + sent + " of " + targets.length + " — " + missed + " didn't go through.");
+  } else {
+    forwardError(lastError || "Couldn't send that.");
+    return;
+  }
+  await loadMessages();
 }
+
+// The picker is reachable with no chat behind it (a photo shared in from
+// another app), where #send-error — which lives inside the chat screen — would
+// be written to an invisible element. Toast in that case.
+function forwardError(msg) {
+  $("send-error").textContent = msg;
+  $("send-error").hidden = false;
+  if ($("chat-screen").hidden) showToast(msg);
+}
+
+// ---- inbound share: an image handed to us by the device share sheet ----
+// The shell parks the bytes natively and the page collects them here. The
+// readiness check is the security boundary the feature turns on: while the lock
+// screen (or the setup wizard) is up this returns without collecting, so the
+// image stays behind the bridge, the contact list is never drawn, and the user
+// has to unlock before there is anything to tap. Called from showUnlocked() —
+// which is reached only with a live session — and from the onNewIntent nudge
+// below, which can fire while locked and must be filtered by the same check.
+// See android/app/src/main/java/org/molepipe/molepipe/SharedImage.kt.
+function consumeSharedImage() {
+  if (!isAndroid) return;
+  if (!sessionToken || screens.unlocked.hidden) return;
+  let raw = "";
+  try { raw = window.AndroidShell?.takeSharedImage?.() || ""; } catch (_) { return; }
+  if (!raw) return;
+  let payload = null;
+  try { payload = JSON.parse(raw); } catch (_) { return; }
+  if (!payload || !payload.data) return;
+  const mime = /^image\/[a-z0-9.+-]+$/.test(payload.mime || "") ? payload.mime : "image/jpeg";
+  let blob = null;
+  try { blob = base64ToBlob(payload.data, mime); } catch (_) { showToast("Couldn't read that image."); return; }
+  openForwardPicker({ kind: "image", blob }, { title: "Send photo to\u2026" });
+}
+
+// Decodes the bridge's base64 into a Blob. Deliberately not via a data: URL and
+// fetch() — see the CSP note in doForward.
+function base64ToBlob(b64, mime) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new Blob([bytes], { type: mime });
+}
+
+// Nudge from the shell when a share lands on an already-running app. A cold
+// start has no page to nudge and is covered by showUnlocked()'s own pull.
+window.onSharedImage = () => { consumeSharedImage(); };
 
 // Delete for me: remove this copy from my own devices only. Unlike
 // delete-for-everyone it never contacts the peer, so it works on any message —
@@ -4444,8 +5630,7 @@ function updateSelectBar() {
     const m = messages.find((z) => z.id === id);
     return m && m.direction === "out" && !m.delivery && chatKind === "contact" && withinDeleteWindow(m.at);
   });
-  $("select-delete").style.opacity = hasDeletable ? "1" : "0.4";
-  $("select-delete").style.pointerEvents = hasDeletable ? "auto" : "none";
+  $("select-delete").disabled = !hasDeletable;
 }
 
 function startSelectionMode(id) {
@@ -4518,7 +5703,7 @@ function submitOnEnter(id) {
   const f = $(id); if (!f) return;
   f.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); f.closest("form")?.requestSubmit(); } });
 }
-["password", "pin", "compose-text", "find-account", "display-name-input", "mailbox-input", "gib-input", "link-code-input", "create-password", "create-password2", "recover-password", "pin-password", "pin-new", "pin-confirm", "duress-password", "duress-code", "duress-code2"].forEach(submitOnEnter);
+["password", "pin", "compose-text", "find-account", "link-code-input", "create-password", "create-password2", "recover-password", "recover-mnemonic", "wiz-pin-new", "wiz-pin-confirm", "wiz-link-code", "view-phrase-password", "duress-password", "duress-code", "duress-code2"].forEach(submitOnEnter);
 
 // Send button: disabled when compose box is empty
 $("compose-text").addEventListener("input", () => {
@@ -4539,6 +5724,15 @@ window.handleAndroidBack = function() {
   // Message action menu / reaction bar — back tears the whole thing down.
   if (!$("msg-menu").hidden) { closeMsgMenu(); return true; }
   if (!$("forward-modal").hidden) { closeForwardPicker(); return true; }
+  // A confirm dialog is the top-most interaction: back/Escape cancels it. It
+  // sits above the image viewer because Remove-profile-picture opens a confirm
+  // ON TOP of the viewer — checked after, back would have closed the viewer out
+  // from under the question and left it hanging.
+  if (confirmOpen()) { confirmResolver(false); return true; }
+  // The avatar crop editor holds unsaved framing: back cancels the crop (and
+  // resolves its promise) rather than falling through to the screen beneath.
+  const crop = $("avatar-crop");
+  if (crop && !crop.hidden) { closeAvatarCropper(null); return true; }
   const viewer = $("image-viewer");
   if (viewer && !viewer.hidden) { closeImageViewer(); return true; }
   // The search overlay is a full-screen view above the chat list — back closes it.
@@ -4550,27 +5744,29 @@ window.handleAndroidBack = function() {
   // Tor log bottom sheet — close it on back.
   const torLog = $("tor-log-dialog");
   if (torLog && torLog.open) { torLog.close(); return true; }
-  // A confirm dialog is the top-most interaction: back/Escape cancels it.
-  if (confirmOpen()) { confirmResolver(false); return true; }
   // 0. A modal dialog takes back before anything else.
   const relayOffer = $("relay-offer");
   if (relayOffer && !relayOffer.hidden) { closeRelayOffer(); return true; }
+  const phraseModal = $("confirm-phrase-modal");
+  if (phraseModal && !phraseModal.hidden) { phraseModal.hidden = true; return true; }
   // 1. Close chat overflow menu if open
   const menu = $("chat-menu");
   if (menu && !menu.hidden) {
     menu.hidden = true;
     return true;
   }
-  // 2. Close open sub-boxes, modals, or forms
+  const gmenu = $("group-menu");
+  if (gmenu && !gmenu.hidden) {
+    gmenu.hidden = true;
+    return true;
+  }
+  // 2. Close open sub-boxes and inline forms.
   const subBoxes = [
-    { id: "edit-dialog", hide: () => { $("edit-dialog").hidden = true; editDialogResolver && editDialogResolver(false); } },
+    { id: "edit-dialog", hide: () => { editDialogResolver && editDialogResolver(false); } },
     { id: "link-new-box", hide: () => $("link-new-box").hidden = true },
     { id: "link-existing-form", hide: () => $("link-existing-form").hidden = true },
     { id: "duress-wizard", hide: () => $("duress-wizard").hidden = true },
     { id: "wipe-form", hide: () => $("wipe-form").hidden = true },
-    { id: "recover-form", hide: () => { $("recover-form").hidden = true; $("create-view").hidden = false; } },
-    { id: "phrase-view", hide: () => { clearOnboardingSecrets(); $("phrase-view").hidden = true; $("create-view").hidden = false; } },
-    { id: "verify-view", hide: () => { clearOnboardingSecrets(); $("verify-view").hidden = true; $("create-view").hidden = false; } }
   ];
   for (const box of subBoxes) {
     const el = $(box.id);
@@ -4578,6 +5774,15 @@ window.handleAndroidBack = function() {
       box.hide();
       return true;
     }
+  }
+  // 2b. Onboarding wizard: back steps to the previous panel via WIZ_FLOW —
+  // never the legacy sub-box teardown, which desynced wizStep and could wipe
+  // the recovery phrase behind an open modal. From welcome, back exits the app.
+  const noneView = $("view-none");
+  if (noneView && !noneView.hidden) {
+    const flow = WIZ_FLOW[wizStep];
+    if (flow && flow.back) { wizGoTo(flow.back); return true; }
+    return false; // on welcome (or a step with no back) — let the platform exit
   }
   // 2b. Multi-select is a chat-scoped mode, not a separate screen: back must exit
   // it (and keep the chat open) before it can fall through to closing the chat —
@@ -4678,12 +5883,442 @@ window.addEventListener("keydown", (e) => {
 
 initTheme();
 initNotifs();
-// Trade a one-time ?x= bootstrap token for the real one if that's how we were
-// launched (cmd/server browser), then start. Without a control token every /api
-// call is refused (see controlToken above), so skip the doomed status probe and
-// tell the user how to recover.
-exchangeControlToken().then(() => {
-  if (controlToken) refresh();
-  else showControlTokenError();
+// boot trades a one-time ?x= bootstrap token for the real one if that's how we
+// were launched (cmd/server browser), then starts. Without a control token
+// every /api call is refused (see controlToken above), so skip the doomed
+// status probe and tell the user how to recover. Every failure path ends on a
+// message, never on the silent "Loading…" placeholder.
+function boot() {
+  const retry = $("loading-retry");
+  if (retry) retry.hidden = true;
+  const msg = $("loading-msg");
+  if (msg) msg.textContent = "Loading…";
+  exchangeControlToken().then(() => {
+    if (!controlToken) return showControlTokenError();
+    // Android only: pick the session back up if the shell is still holding one
+    // from before a WebView rebuild. Gated on isAndroid as well as the method so
+    // the desktop and browser builds, served this same file, keep the strict
+    // memory-only behaviour no matter what a future shell bridge is called.
+    if (isAndroid && window.AndroidShell?.getSessionToken) {
+      try { sessionToken = window.AndroidShell.getSessionToken() || null; } catch (_) {}
+    }
+    refresh();
+  }).catch(() => showLoadingError("Couldn't reach the Molepipe backend."));
+}
+const loadingRetryBtn = $("loading-retry");
+if (loadingRetryBtn) loadingRetryBtn.addEventListener("click", boot);
+boot();
+
+
+// ============================================================================
+// Friend profile pane (#contact-info)
+// ----------------------------------------------------------------------------
+// A sub-screen of an open 1:1 chat, reached by tapping the contact's name or
+// avatar in the chat header. It gathers the per-contact surfaces that had no
+// home: shared media, in-conversation search, notification mute, the media
+// auto-save policy, groups in common, and the existing block / clear actions.
+//
+// Media and search read the already-loaded `messages` array rather than calling
+// the backend: the conversation is polled into memory anyway, so filtering it is
+// free and stays correct as new messages land.
+// ============================================================================
+
+let ciAccount = null;      // account whose profile is open (null = pane closed)
+let ciCommonGroups = [];   // groups we share with them, from /api/groups/common
+let ciGroupsLoaded = false;
+
+function ciContact() { return contacts.find((c) => c.account === ciAccount) || null; }
+
+// ciConvo is every message in this 1:1 conversation, oldest first — the same
+// filter renderMessages uses, so the pane can never disagree with the chat.
+function ciConvo() {
+  return messages.filter((m) => m.peer === ciAccount && !m.group_id);
+}
+
+// mediaAttachId resolves the attachment-store key for an image message.
+// /api/messages sets attach_id ONLY on group images; a 1:1 image is keyed by the
+// row id itself ("A 1:1 image renders by its row id, so it needs none of these"
+// — handleListMessages). Reading m.attach_id alone yielded undefined for every
+// 1:1 photo, so the grid fetched ?id=undefined and sat on a grey skeleton.
+function mediaAttachId(m) { return m.attach_id || m.id; }
+
+function openContactInfo() {
+  if (!currentPeer || chatKind !== "contact") return;
+  ciAccount = currentPeer;
+  ciCommonGroups = [];
+  ciGroupsLoaded = false;
+  $("ci-search-input").value = "";
+  $("ci-search-clear").hidden = true;
+  $("ci-action-error").hidden = true;
+  showDetail("contact-info");
+  renderContactInfo();
+  loadCommonGroups();
+}
+
+async function loadCommonGroups() {
+  const acct = ciAccount;
+  const { ok, body } = await api("/api/groups/common", {
+    method: "POST", body: JSON.stringify({ account: acct }),
+  });
+  // The pane may have been closed or reopened on someone else while this was in
+  // flight; a late response must not paint another contact's groups.
+  if (!ok || acct !== ciAccount) return;
+  ciCommonGroups = body.groups || [];
+  ciGroupsLoaded = true;
+  renderCiGroups();
+}
+
+function renderContactInfo() {
+  if (!ciAccount) return;
+  const c = ciContact();
+  const name = contactName(ciAccount);
+  const av = $("ci-avatar-btn");
+  av.innerHTML = "";
+  av.append(avatarNode(c && c.avatar_hash, name, null));
+  av.disabled = !(c && c.avatar_hash); // no picture → nothing to open full screen
+  $("ci-name").textContent = name;
+  // With a nickname set, the hero shows it as the name and the peer's own
+  // published name underneath, so "who did I rename?" is always answerable.
+  const real = $("ci-realname");
+  const published = (c && c.name) || "";
+  const nicked = !!(c && c.nickname);
+  real.hidden = !(nicked && published);
+  real.textContent = nicked && published ? published : "";
+  $("ci-nickname-btn").setAttribute("aria-label", nicked ? "Edit nickname for this contact" : "Add a nickname for this contact");
+  const state = presenceFor(ciAccount);
+  const pres = $("ci-presence");
+  pres.textContent = "";
+  pres.append(presenceDot(state), " " + (PRESENCE_LABEL[state] || ""));
+  pres.className = "body muted presence-text-" + state;
+  $("ci-account").textContent = ciAccount;
+  renderCiSettings();
+  renderCiMedia();
+  renderCiSearch();
+  renderCiGroups();
+}
+
+// ---- settings: mute + media auto-save ----
+
+function renderCiSettings() {
+  const c = ciContact();
+  const muted = !!(c && c.muted);
+  const sw = $("ci-mute-switch");
+  if (sw.selected !== muted) sw.selected = muted;
+  $("ci-mute-state").textContent = muted
+    ? "Muted — messages still arrive, quietly"
+    : "Notifications are on";
+
+  const policy = (c && c.media_auto_save) || "default";
+  $("contact-info").querySelectorAll(".ci-media-toggle .seg")
+    .forEach((b) => b.classList.toggle("active", b.dataset.media === policy));
+  const globalOn = !!myMediaAutoSave;
+  $("ci-media-hint").textContent =
+    policy === "on" ? "Photos from this chat are copied into your phone's gallery."
+    : policy === "off" ? "Photos from this chat stay inside Molepipe."
+    : globalOn
+      ? "Following your default: photos are copied into your phone's gallery."
+      : "Following your default: photos stay inside Molepipe.";
+}
+
+async function setCiSettings(patch) {
+  const acct = ciAccount;
+  const { ok } = await api("/api/contacts/settings", {
+    method: "POST", body: JSON.stringify(Object.assign({ account: acct }, patch)),
+  });
+  if (!ok) {
+    $("ci-action-error").textContent = "Couldn't save that setting.";
+    $("ci-action-error").hidden = false;
+    return false;
+  }
+  $("ci-action-error").hidden = true;
+  await loadContacts();       // refresh the cached row the pane renders from
+  if (ciAccount === acct) renderCiSettings();
+  return true;
+}
+
+// ---- nickname ----
+
+// The nickname is private to this device and the user's own linked devices: it is
+// stored on our Contact record, never sent to the peer, and it survives them
+// renaming themselves (their signed profile owns Contact.Name, which the nickname
+// shadows rather than replaces). See chatstore.Contact.Nickname.
+$("ci-nickname-btn").addEventListener("click", async () => {
+  const c = ciContact();
+  const current = (c && c.nickname) || "";
+  const result = await editDialog({
+    title: current ? "Edit nickname" : "Add a nickname",
+    fields: [{ id: "nickname", label: "Nickname", type: "text" }],
+    values: { nickname: current },
+  });
+  if (!result) return;
+  const next = result.nickname.trim();
+  if (next === current) return;
+  // Spread, not .length: a string's length is UTF-16 units, so 33 emoji would
+  // trip a 64 "character" check that the server (counting runes) would pass.
+  if ([...next].length > 64) {
+    $("ci-action-error").textContent = "That nickname is too long (64 characters max).";
+    $("ci-action-error").hidden = false;
+    return;
+  }
+  const acct = ciAccount;
+  // An empty value clears the nickname — that is the "remove" path, so there is
+  // no separate delete control to find.
+  if (!(await setCiSettings({ nickname: next }))) return;
+  if (ciAccount !== acct) return; // the user navigated away mid-save
+  renderContactInfo();
+  // Surfaces outside the pane that name this contact: the detail top bar, and
+  // any quoted-reply authors in the chat sitting behind it. The lists were
+  // already redrawn by loadContacts().
+  $("detail-title").textContent = contactName(acct);
+  if (currentPeer === acct) renderMessages();
+  showToast(next ? "Nickname saved." : "Nickname removed.");
 });
 
+// ---- shared media ----
+
+function renderCiMedia() {
+  const grid = $("ci-media-grid");
+  grid.innerHTML = "";
+  // Newest first: a media panel is usually opened to find something recent.
+  const shots = ciConvo().filter((m) => m.kind === "image").reverse();
+  $("ci-media-empty").hidden = shots.length > 0;
+  for (const m of shots) {
+    const cell = document.createElement("button");
+    cell.type = "button";
+    cell.className = "ci-media-cell";
+    cell.setAttribute("aria-label", "Photo from " + fmtTime(m.at));
+    const img = document.createElement("img");
+    img.alt = "";
+    const aid = mediaAttachId(m);
+    const cached = imageURLs.get(aid);
+    if (cached) img.src = cached;
+    else { img.classList.add("skeleton"); fetchImage(aid, img); }
+    cell.append(img);
+    cell.addEventListener("click", () => {
+      if (img.src && !img.classList.contains("img-missing")) openImageViewer(img.src);
+    });
+    grid.append(cell);
+  }
+}
+
+// ---- in-conversation search ----
+
+function renderCiSearch() {
+  const q = $("ci-search-input").value.trim().toLowerCase();
+  const box = $("ci-search-results");
+  box.innerHTML = "";
+  $("ci-search-clear").hidden = q === "";
+  if (!q) return;
+  // Newest first, and capped: this renders synchronously on every keystroke, and
+  // a long conversation would otherwise build thousands of nodes per character.
+  const hits = ciConvo()
+    .filter((m) => m.kind !== "image" && (m.text || "").toLowerCase().includes(q))
+    .reverse();
+  if (!hits.length) {
+    const none = document.createElement("p");
+    none.className = "body muted";
+    none.textContent = "No messages match “" + $("ci-search-input").value.trim() + "”.";
+    box.append(none);
+    return;
+  }
+  for (const m of hits.slice(0, 50)) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "ci-hit";
+    row.setAttribute("role", "listitem");
+    const who = document.createElement("span");
+    who.className = "label muted";
+    who.textContent = (m.direction === "out" ? "You" : contactName(ciAccount)) + " · " + fmtTime(m.at);
+    const txt = document.createElement("span");
+    txt.className = "body ci-hit-text";
+    txt.textContent = m.text || "";
+    row.append(who, txt);
+    row.addEventListener("click", () => jumpToMessage(m.id));
+    box.append(row);
+  }
+  if (hits.length > 50) {
+    const more = document.createElement("p");
+    more.className = "label muted";
+    more.textContent = hits.length - 50 + " more matches — keep typing to narrow it down.";
+    box.append(more);
+  }
+}
+
+// jumpToMessage returns to the chat and scrolls the hit into view, flashing it
+// so the eye can find it in a wall of text.
+function jumpToMessage(id) {
+  showDetail("chat");
+  renderMessages();
+  requestAnimationFrame(() => {
+    const row = $("messages").querySelector('[data-msg-id="' + CSS.escape(id) + '"]');
+    if (!row) return;
+    row.scrollIntoView({ block: "center" });
+    row.classList.add("msg-flash");
+    setTimeout(() => row.classList.remove("msg-flash"), 1600);
+  });
+}
+
+// ---- groups in common ----
+
+function renderCiGroups() {
+  const box = $("ci-groups");
+  box.innerHTML = "";
+  $("ci-groups-empty").hidden = !ciGroupsLoaded || ciCommonGroups.length > 0;
+  for (const g of ciCommonGroups) {
+    const row = document.createElement("md-list-item");
+    row.setAttribute("type", "button");
+    const head = document.createElement("div");
+    head.setAttribute("slot", "headline");
+    head.textContent = g.name || "Group";
+    const sub = document.createElement("div");
+    sub.setAttribute("slot", "supporting-text");
+    sub.textContent = g.member_count + (g.member_count === 1 ? " member" : " members");
+    row.append(head, sub);
+    row.addEventListener("click", () => openGroup(g.id));
+    box.append(row);
+  }
+}
+
+// ---- friend profile: wiring ----
+
+// Tapping the contact's name or picture in the chat header opens their profile.
+// Groups keep their existing "Group info & members" menu item, so this is gated
+// on a 1:1 chat.
+function ciHeaderTap() {
+  if (detailContent === "chat" && chatKind === "contact" && currentPeer) openContactInfo();
+}
+$("detail-titles").addEventListener("click", ciHeaderTap);
+$("detail-avatar").addEventListener("click", ciHeaderTap);
+
+// The profile picture opens full screen in the viewer everything else uses.
+$("ci-avatar-btn").addEventListener("click", async () => {
+  const c = ciContact();
+  if (!c || !c.avatar_hash) return;
+  const url = await avatarObjectURL(c.avatar_hash);
+  if (url) openImageViewer(url);
+});
+
+$("ci-search-input").addEventListener("input", renderCiSearch);
+$("ci-search-clear").addEventListener("click", () => {
+  const i = $("ci-search-input");
+  i.value = "";
+  renderCiSearch();
+  i.focus();
+});
+
+$("ci-mute-switch").addEventListener("change", async (e) => {
+  const want = e.target.selected;
+  // Re-render from the server's answer rather than trusting the switch: if the
+  // write fails the control must snap back, not sit there lying.
+  if (!(await setCiSettings({ muted: want }))) renderCiSettings();
+});
+
+$("contact-info").querySelector(".ci-media-toggle").addEventListener("click", async (e) => {
+  const b = e.target.closest(".seg");
+  if (!b) return;
+  if (!(await setCiSettings({ media_auto_save: b.dataset.media }))) renderCiSettings();
+});
+
+$("ci-clear-btn").addEventListener("click", async () => {
+  const acct = ciAccount;
+  const ok0 = await confirmDialog({
+    title: "Clear this chat?",
+    message: "Every message and photo in this conversation is removed from your devices. "
+      + contactName(acct) + " keeps their copy, and you stay contacts.",
+    confirmLabel: "Clear",
+    danger: true,
+  });
+  if (!ok0) return;
+  const { ok } = await api("/api/messages/clear", {
+    method: "POST", body: JSON.stringify({ account: acct }),
+  });
+  if (!ok) {
+    $("ci-action-error").textContent = "Couldn't clear this chat.";
+    $("ci-action-error").hidden = false;
+    return;
+  }
+  await loadMessages();
+  renderContactInfo();
+  showToast("Chat cleared");
+});
+
+// Block reuses the existing contact-menu flow (confirm → /api/contacts/block →
+// back to the chat list) rather than duplicating it here.
+$("ci-block-btn").addEventListener("click", () => {
+  const menu = $("chat-menu");
+  const btn = menu.querySelector('[data-action="block"]');
+  if (btn) btn.click();
+});
+
+// ---- media auto-save on receipt ----
+
+// effectiveMediaAutoSave resolves the per-contact override against the global
+// default. The override is a tri-state string ("default"/"on"/"off") precisely
+// so "inherit" stays distinguishable from "explicitly off".
+function effectiveMediaAutoSave(account) {
+  const c = contacts.find((x) => x.account === account);
+  const p = (c && c.media_auto_save) || "default";
+  if (p === "on") return true;
+  if (p === "off") return false;
+  return !!myMediaAutoSave;
+}
+
+// Image message ids we've already considered for auto-save. Seeded from the
+// FIRST poll after unlock without saving anything: without that seed, unlocking
+// would dump the entire conversation backlog into the phone's gallery — the
+// exact outcome someone who turns this on for one contact is not asking for.
+const mediaSaveSeen = new Set();
+let mediaSaveSeeded = false;
+
+async function autoSaveNewMedia() {
+  const inbound = messages.filter((m) => m.kind === "image" && m.direction === "in" && !m.group_id);
+  if (!mediaSaveSeeded) {
+    for (const m of inbound) mediaSaveSeen.add(m.id);
+    mediaSaveSeeded = true;
+    return;
+  }
+  if (!window.AndroidShell || !window.AndroidShell.saveImageToGallery) return;
+  for (const m of inbound) {
+    if (mediaSaveSeen.has(m.id)) continue;
+    mediaSaveSeen.add(m.id); // mark first: a failure must not retry every poll
+    if (!effectiveMediaAutoSave(m.peer)) continue;
+    try {
+      const res = await fetch("/api/attachment?id=" + encodeURIComponent(mediaAttachId(m)), {
+        headers: { Authorization: "Bearer " + sessionToken, "X-Control-Token": controlToken },
+      });
+      if (!res.ok) continue;
+      const blob = await res.blob();
+      window.AndroidShell.saveImageToGallery(await blobToBase64(blob), blob.type || "image/jpeg");
+    } catch (_) { /* a failed save is not worth interrupting the chat for */ }
+  }
+}
+
+// ---- global media auto-save toggle (You > Notifications) ----
+
+// Android-only: the desktop/browser build has no gallery to copy into, and the
+// native bridge it would call does not exist there.
+function syncMediaSaveSection() {
+  const sec = $("media-save-section");
+  if (!sec) return;
+  const supported = !!(window.AndroidShell && window.AndroidShell.saveImageToGallery);
+  sec.hidden = !supported;
+  if (!supported) return;
+  const sw = $("media-save-switch");
+  if (sw.selected !== myMediaAutoSave) sw.selected = myMediaAutoSave;
+  $("media-save-state").textContent = myMediaAutoSave
+    ? "On — photos are copied to your gallery"
+    : "Off — photos stay inside Molepipe";
+}
+
+$("media-save-switch").addEventListener("change", async (e) => {
+  const want = e.target.selected;
+  const { ok, body } = await api("/api/profile", {
+    method: "POST", body: JSON.stringify({ media_auto_save: want }),
+  });
+  // Trust the server's echo, not the switch: a failed write must not leave the
+  // UI claiming photos are staying private when the backend disagrees.
+  myMediaAutoSave = ok ? !!body.media_auto_save : myMediaAutoSave;
+  syncMediaSaveSection();
+  if (detailContent === "contact-info") renderCiSettings();
+  if (!ok) showToast("Couldn't save that setting");
+});

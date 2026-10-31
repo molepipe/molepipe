@@ -51,6 +51,24 @@ type Sidecar struct {
 	ready     atomic.Bool // descriptor published (inbound reachable)
 	dialable  atomic.Bool // bootstrap done (outbound circuits available — send-ready)
 	logfile   *os.File
+
+	// extras holds rotation-alias services, each a SEPARATE `arti proxy` child in
+	// its own state dir (keyed by a monotonic id handed back to the caller). A
+	// separate process — rather than rewriting the primary's config and
+	// restarting it — keeps the primary onion from blipping while an alias runs
+	// (an alias lives for the whole grace window, potentially days), and lets one
+	// alias be torn down independently by killing its child. See StartExtraService.
+	extras      map[uint64]*extraChild
+	nextExtraID uint64
+}
+
+// extraChild is one rotation-alias onion service (a child arti process).
+type extraChild struct {
+	cmd     *exec.Cmd
+	dir     string // workDir/alias-<id>, holds its own state/cache/keystore
+	keyPath string
+	logfile *os.File
+	ready   atomic.Bool
 }
 
 // New returns a sidecar. bin is the arti binary (e.g. "arti"); workDir is a
@@ -259,6 +277,132 @@ func (s *Sidecar) StartClient(ctx context.Context) error {
 	return nil
 }
 
+// StartExtraService launches an additional onion service (a rotation alias)
+// alongside the primary, as a separate `arti proxy` child in its own state dir,
+// forwarding its virtual port to localAddr. It returns the .onion address and an
+// opaque id for StopExtraService. The primary keeps running undisturbed. This is
+// the desktop counterpart of artihost.StartExtraService; both are reached from
+// the api layer via the extraOnionHost optional upcast (not the tor.OnionService
+// interface, so nothing else needs to implement it).
+//
+// Unlike the shared-client mobile shim, each alias is a full independent arti
+// client (own guards/consensus cache under its dir), which desktop can afford
+// and which keeps alias lifecycle from perturbing the primary.
+func (s *Sidecar) StartExtraService(key tor.OnionKey, localAddr, nickname string) (string, uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	bin, err := s.resolveBin()
+	if err != nil {
+		return "", 0, err
+	}
+	if nickname == "" {
+		nickname = s.nickname
+	}
+	if s.extras == nil {
+		s.extras = map[uint64]*extraChild{}
+	}
+	s.nextExtraID++
+	id := s.nextExtraID
+
+	dir := filepath.Join(s.workDir, fmt.Sprintf("alias-%d", id))
+	state := filepath.Join(dir, "state")
+	cache := filepath.Join(dir, "cache")
+	hssDir := filepath.Join(state, "keystore", "hss", nickname)
+	// Start clean: an alias dir must never adopt a stale key from a crashed run
+	// that reused this id.
+	_ = removeAliasDir(dir)
+	for _, d := range []string{dir, state, cache, hssDir} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			return "", 0, fmt.Errorf("create %s: %w", d, err)
+		}
+	}
+
+	keyBytes, err := key.MarshalKeystoreKey()
+	if err != nil {
+		return "", 0, err
+	}
+	keyPath := filepath.Join(hssDir, tor.KeystoreFileName)
+	if err := os.WriteFile(keyPath, keyBytes, 0o600); err != nil {
+		return "", 0, fmt.Errorf("write alias onion key: %w", err)
+	}
+
+	cfgPath := filepath.Join(dir, "arti.toml")
+	if err := os.WriteFile(cfgPath, []byte(renderConfig(state, cache, nickname, localAddr)), 0o600); err != nil {
+		return "", 0, fmt.Errorf("write alias arti config: %w", err)
+	}
+	socksPort, err := freeLoopbackPort()
+	if err != nil {
+		return "", 0, fmt.Errorf("allocate alias socks port: %w", err)
+	}
+	cmd := exec.Command(bin, "proxy", "-c", cfgPath, "-p", socksPort)
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return "", 0, err
+	}
+	child := &extraChild{cmd: cmd, dir: dir, keyPath: keyPath}
+	child.logfile, _ = os.OpenFile(filepath.Join(dir, "arti.log"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err := cmd.Start(); err != nil {
+		if child.logfile != nil {
+			child.logfile.Close()
+		}
+		return "", 0, fmt.Errorf("start alias arti: %w", err)
+	}
+	s.extras[id] = child
+	go s.watchExtra(child, stderr)
+
+	addr := identity.AccountNumberForPub(ed25519.PublicKey(key.Public[:])) + ".onion"
+	return addr, id, nil
+}
+
+// StopExtraService kills the alias child for id, wipes its key material, and
+// removes its state dir. A no-op for an unknown id. The primary is untouched.
+func (s *Sidecar) StopExtraService(id uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	child := s.extras[id]
+	if child == nil {
+		return
+	}
+	stopExtraChild(child)
+	delete(s.extras, id)
+}
+
+// stopExtraChild kills a child arti, closes its log, and scrubs its dir. Caller
+// holds s.mu.
+func stopExtraChild(child *extraChild) {
+	if child.cmd != nil && child.cmd.Process != nil {
+		_ = child.cmd.Process.Kill()
+		_, _ = child.cmd.Process.Wait()
+	}
+	if child.logfile != nil {
+		child.logfile.Close()
+	}
+	_ = removeAliasDir(child.dir)
+}
+
+// watchExtra tees an alias child's stderr to its log and latches its readiness
+// on descriptor publication.
+func (s *Sidecar) watchExtra(child *extraChild, r io.Reader) {
+	sc := bufio.NewScanner(r)
+	for sc.Scan() {
+		line := sc.Text()
+		if child.logfile != nil {
+			fmt.Fprintln(child.logfile, line)
+		}
+		if strings.Contains(line, readyMarker) {
+			child.ready.Store(true)
+		}
+	}
+}
+
+// removeAliasDir scrubs an alias's key material then removes its whole dir.
+func removeAliasDir(dir string) error {
+	// Overwrite the key/runtime-state files before unlink, then drop the dir.
+	_ = wipe.Dir(filepath.Join(dir, "state", "keystore"))
+	_ = wipe.Dir(filepath.Join(dir, "state", "hss"))
+	return os.RemoveAll(dir)
+}
+
 // Ready reports whether the descriptor has been published (primary mode), or
 // that the proxy has bootstrapped (client mode).
 func (s *Sidecar) Ready() bool { return s.ready.Load() }
@@ -305,6 +449,15 @@ func (s *Sidecar) Sweep() error {
 	if s.cmd != nil {
 		return nil
 	}
+	// Also scrub any alias dirs a crashed prior run left behind, so a leftover
+	// plaintext alias key never survives into a new session.
+	if entries, err := os.ReadDir(s.workDir); err == nil {
+		for _, e := range entries {
+			if e.IsDir() && strings.HasPrefix(e.Name(), "alias-") {
+				_ = removeAliasDir(filepath.Join(s.workDir, e.Name()))
+			}
+		}
+	}
 	return removeKeyMaterial(s.workDir)
 }
 
@@ -330,6 +483,12 @@ func (s *Sidecar) Stop() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var firstErr error
+	// Tear down every rotation alias so no alias child (or its key) outlives the
+	// session alongside the primary.
+	for id, child := range s.extras {
+		stopExtraChild(child)
+		delete(s.extras, id)
+	}
 	if s.cmd != nil && s.cmd.Process != nil {
 		_ = s.cmd.Process.Kill()
 		_, _ = s.cmd.Process.Wait()

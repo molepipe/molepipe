@@ -23,7 +23,7 @@ import (
 
 const (
 	fileName    = "messages.enc"
-	fileVersion = 1
+	fileVersion = 2
 )
 
 // ErrNewerVersion is returned by Load when messages.enc was written by a newer
@@ -57,7 +57,14 @@ const (
 type Contact struct {
 	Account string `json:"account"`
 	Name    string `json:"name"`
-	Status  string `json:"status"`
+	// Nickname is the LOCAL label the user has chosen for this contact. It is
+	// private: it never goes on the wire (nothing marshals a Contact to a peer —
+	// group rosters are built from GroupMember, not from here), and it is never
+	// written by an inbound profile update, so a peer renaming themselves cannot
+	// disturb it and cannot discover it. Empty = no nickname; use DisplayName to
+	// resolve rather than reading either name field directly.
+	Nickname string `json:"nickname,omitempty"`
+	Status   string `json:"status"`
 	// ReqID binds a friend request to its accept: set on the pending_out side to
 	// the id we sent, and echoed by the accept we require to match.
 	ReqID string `json:"req_id,omitempty"`
@@ -67,7 +74,36 @@ type Contact struct {
 	MailboxURL string `json:"mailbox_url,omitempty"`
 	// DHPub is the peer's cached X25519 public key from their signed profile,
 	// needed to encrypt an offline mailbox message (no live handshake to get it).
+	// It is also the ROTATION CONTINUITY ANCHOR: the peer's onion (Account) may
+	// rotate, but this non-rotating m/0'/1' key is how we recognise a verified
+	// AddressRotation as genuinely from this contact. See AliasIndex.
 	DHPub []byte `json:"dh_pub,omitempty"`
+	// AliasIndex is the highest rotation alias index we have accepted from this
+	// contact (the monotonic rollback-replay guard). A received AddressRotation is
+	// applied only when its index exceeds this; on apply, Account is migrated to the
+	// new onion and this advances. Zero means no rotation seen yet (the contact is
+	// at its bootstrap alias). Not sequential — gaps are fine.
+	AliasIndex uint32 `json:"alias_index,omitempty"`
+	// MyAccountKnown is the account (== onion label) of OUR alias that THIS contact
+	// currently knows us by — i.e. the sender identity we must stamp on outbound
+	// messages to them so their AllowMessage gate and session lookup resolve. It is
+	// the send-side mirror of AliasIndex (which tracks THEIR rotations; this tracks
+	// which of OUR aliases they have acked). Empty means the primary account — the
+	// correct default for every existing contact, so no migration is needed. It only
+	// advances to a rotation alias once the contact acks that we have rotated (see
+	// RotationPending / the rotation-delivery ack flow); stamping a not-yet-acked
+	// alias would fail their gate, which is why the switch is per-contact and
+	// ack-driven rather than global.
+	MyAccountKnown string `json:"my_account_known,omitempty"`
+	// MyAliasIndexKnown is the alias index MyAccountKnown names — stored (rather than
+	// recovered by mapping the account back through RotationState) because the grace
+	// sweeper prunes retired aliases from RotationState.History, so a string→index
+	// lookup would lose the index exactly when a contact still lags there. It is the
+	// no-regress guard for the ack handler: an ack advances MyAccountKnown only when
+	// its index strictly exceeds this (or MyAccountKnown is empty — the primary
+	// sentinel, since index 0 is itself a real alias). Always written together with
+	// MyAccountKnown; meaningless while MyAccountKnown is empty.
+	MyAliasIndexKnown uint32 `json:"my_alias_index_known,omitempty"`
 	// AvatarHash is the sha256 hex of the peer's avatar, learned from their signed
 	// profile card. The bytes are fetched by this hash from their ungated
 	// AvatarPath and cached in the local AvatarStore; the UI renders from that
@@ -88,6 +124,29 @@ type Contact struct {
 	RelayPending bool `json:"relay_pending,omitempty"`
 	// RelayReqID binds a relay-request to its accept, like ReqID.
 	RelayReqID string `json:"relay_req_id,omitempty"`
+	// Muted silences system notifications for this contact's messages. The
+	// message still arrives, still lands in the log and still counts as unread —
+	// only the notification is suppressed — so muting never costs delivery. It is
+	// enforced at the inbound hook, which is the one place that still knows the
+	// ACCOUNT: the Android listener is handed a display name only.
+	Muted bool `json:"muted,omitempty"`
+	// MediaAutoSave overrides Profile.MediaAutoSave for this contact. It is a
+	// POINTER so "inherit the global" stays distinguishable from "explicitly
+	// off": with a plain bool, a contact the user had deliberately set to off
+	// would silently follow the global default back on.
+	MediaAutoSave *bool `json:"media_auto_save,omitempty"`
+}
+
+// DisplayName is the one rule for how a contact is labelled: the user's own
+// nickname wins over the name the peer published for themselves. It returns ""
+// when neither is set, leaving the caller to apply its own fallback (usually the
+// raw account number) — callers must not reach past this to .Name, or a nickname
+// silently fails to apply on that surface.
+func (c Contact) DisplayName() string {
+	if c.Nickname != "" {
+		return c.Nickname
+	}
+	return c.Name
 }
 
 // Profile is the identity's own shareable card.
@@ -117,6 +176,15 @@ type Profile struct {
 	// Profile so the setting syncs to my other devices; it is stripped from the
 	// friend-facing protocol.Profile (see the hook wiring), so contacts never see it.
 	GroupImageBackupBytes int64 `json:"group_image_backup_bytes,omitempty"`
+	// MediaAutoSave is the GLOBAL default for copying received images out of the
+	// encrypted attachment store into the phone's own gallery (Pictures/Molepipe
+	// via MediaStore). False — the current behaviour — keeps every image inside
+	// the app, where the system gallery, photo pickers and cloud backup cannot
+	// see it; that is why this defaults off and is a privacy control rather than
+	// a storage one. Per-contact overrides live in Contact.MediaAutoSave. Rides
+	// in Profile so the setting syncs to my other devices, and is stripped from
+	// the friend-facing protocol.Profile like GroupImageBackupBytes above.
+	MediaAutoSave bool `json:"media_auto_save,omitempty"`
 }
 
 // Device is a linked device authorized to sync this identity's data. The private
@@ -458,6 +526,53 @@ func (m Message) syncID() string {
 	return MessageID(m.Direction, m.Peer, m.Text, m.At)
 }
 
+// StoredSignedPrekey is a signed X25519 prekey persisted in the encrypted store.
+// The private key is needed for DH ratchet operations when establishing new
+// sessions. Old prekeys are retained during a grace period for delayed messages,
+// then permanently retired and their private keys deleted.
+type StoredSignedPrekey struct {
+	ID         uint32     `json:"id"`                   // monotonic prekey ID
+	PublicKey  []byte     `json:"public_key"`           // 32-byte X25519 public key
+	PrivateKey []byte     `json:"private_key"`          // 32-byte X25519 private key (sensitive)
+	Signature  []byte     `json:"signature"`            // Ed25519 signature binding to identity
+	CreatedAt  time.Time  `json:"created_at"`           // when this prekey was generated
+	RetiredAt  *time.Time `json:"retired_at,omitempty"` // when retired (nil = current)
+	Status     string     `json:"status"`               // "current", "retired", "expired"
+}
+
+// StoredOneTimePrekey is a single-use X25519 prekey for asynchronous session
+// establishment. Once consumed by a peer, the private key is deleted.
+type StoredOneTimePrekey struct {
+	ID         uint32    `json:"id"`          // unique prekey ID
+	PublicKey  []byte    `json:"public_key"`  // 32-byte X25519 public key
+	PrivateKey []byte    `json:"private_key"` // 32-byte X25519 private key (sensitive)
+	CreatedAt  time.Time `json:"created_at"`  // when generated
+	// Reserved marks an OTP already handed out in a bundle: it must not be put
+	// in another bundle (each one-time prekey is used at most once), but its
+	// private key is retained until the referencing handshake actually arrives.
+	Reserved bool `json:"reserved,omitempty"`
+	Consumed bool `json:"consumed"` // true once a peer's handshake used it; private deleted
+}
+
+// PrekeyState holds the cryptographic prekey material for the v2 protocol.
+// Signed prekeys are rotated automatically; one-time prekeys are consumed
+// once and deleted.
+type PrekeyState struct {
+	// SignedPrekeys holds the current and recently retired signed prekeys.
+	// The current one is the last element with Status == "current".
+	SignedPrekeys []StoredSignedPrekey `json:"signed_prekeys,omitempty"`
+
+	// OneTimePrekeys holds the pool of unused one-time prekeys.
+	OneTimePrekeys []StoredOneTimePrekey `json:"one_time_prekeys,omitempty"`
+
+	// NextPrekeyID is the monotonic counter for generating unique prekey IDs.
+	// Incremented on every new signed or one-time prekey generation.
+	NextPrekeyID uint32 `json:"next_prekey_id"`
+
+	// PrekeyRotationAt is when the next automatic signed prekey rotation is due.
+	PrekeyRotationAt time.Time `json:"prekey_rotation_at,omitempty"`
+}
+
 // Data is everything persisted.
 type Data struct {
 	Profile  Profile   `json:"profile"`
@@ -484,6 +599,124 @@ type Data struct {
 	// resurrected by the next sync with any device that still held it, and the
 	// deletion would silently undo itself.
 	Deleted []string `json:"deleted,omitempty"`
+
+	// Prekeys holds the v2 protocol prekey material: signed prekeys for
+	// session establishment and one-time prekeys for asynchronous/offline
+	// session setup. Nil/empty on v1 upgrades until first unlock generates
+	// the initial prekey material.
+	Prekeys *PrekeyState `json:"prekeys,omitempty"`
+
+	// RatchetSessions persists established Double Ratchet sessions, keyed by peer
+	// account, each value a JSON-serialized session.SessionState. Held opaquely
+	// here (as bytes) so chatstore need not import the session package. Persisting
+	// the advanced sending-chain state BEFORE a message goes on the wire is what
+	// prevents ratchet-key reuse across a crash/restart.
+	RatchetSessions map[string][]byte `json:"ratchet_sessions,omitempty"`
+
+	// PendingInits records, per peer account, an X3DH initial (handshake) envelope
+	// whose delivery has not yet been acknowledged. Held opaquely as bytes (a JSON
+	// blob owned by the api layer). Until the init is acked, the initiator MUST
+	// resend this exact envelope rather than mint a fresh one — reissuing would
+	// reserve a new one-time prekey and could leave the two sides on forked
+	// sessions if a resend races the original. Cleared once the peer acks.
+	PendingInits map[string][]byte `json:"pending_inits,omitempty"`
+
+	// ProcessedInits records, per peer account, the signature of the last X3DH
+	// init we successfully processed from that peer. An initiator resends the
+	// byte-identical init until we ack it, so a second init bearing a signature
+	// we've already recorded is an ack-lost resend — we ack it idempotently
+	// instead of re-establishing. Keyed on the signature (not the one-time
+	// prekey) so it survives one-time-prekey cleanup and a restart.
+	ProcessedInits map[string][]byte `json:"processed_inits,omitempty"`
+
+	// Rotation is the state of the rotating account identity: which alias index
+	// (m/0'/2'/N') is currently published as our address, when the next automatic
+	// refresh is due, and recently-retired aliases still live within their grace
+	// window. Nil until the first alias is minted. The durable identity (the
+	// m/0'/0' signing key / AccountNumber and the m/0'/1' DH key) never rotates;
+	// only the externally-visible onion address does. See RotationState.
+	Rotation *RotationState `json:"rotation,omitempty"`
+	// PendingRotations is the ack-driven, resend-until-acked set of our own
+	// rotations a contact has not yet acknowledged (mirrors PendingInits). Keyed by
+	// the contact's CURRENT account; the value is the rotation we owe them. Cleared
+	// on their ack, on contact removal, or when the alias retires past its grace
+	// window. Device-local delivery bookkeeping — persisted but not CRDT-merged, the
+	// same treatment as PendingInits/ProcessedInits.
+	PendingRotations map[string]RotationPending `json:"pending_rotations,omitempty"`
+	// PeerAliases maps a contact's now-retired account (an alias they rotated away
+	// from) to the account we currently know that same contact by. It is the
+	// receive-side counterpart of PendingRotations: after we apply a contact's
+	// AddressRotation and migrate their per-peer state to the new onion, an
+	// ack-lost RESEND of that announcement still arrives addressed from the OLD
+	// alias (the sender keeps resending over the old-alias channel until we ack).
+	// Resolving that old alias back to the current account lets the gate, the
+	// session lookup and the idempotent apply recognise the resend instead of
+	// rejecting it as an unknown sender with no session. The on-wire Sender is left
+	// untouched, so message AAD stays symmetric. Device-local bookkeeping —
+	// persisted (so tolerance survives a restart mid-grace) but not CRDT-merged,
+	// the same treatment as PendingRotations/RatchetSessions.
+	PeerAliases map[string]string `json:"peer_aliases,omitempty"`
+
+	// AutoRefresh controls how the always-on invite code behaves after it is used.
+	// The shareable friend code always carries InviteToken now, and a friend request
+	// must present the CURRENT token to be admitted — a tokenless (bare account) or
+	// stale request is refused, so the account is not addable without a live code.
+	// When AutoRefresh is on, a successful redemption rotates the token (the code
+	// works once, then a fresh one appears); when off, the current code stays valid
+	// and reusable until the user manually refreshes it. Off by default. The JSON
+	// tag stays one_time_invite for on-disk continuity with the earlier single-use
+	// feature (an existing false value is a sensible default here). Device-local:
+	// inbound friend requests land on the publishing (primary) device, which mints,
+	// shows and rotates the token, so both fields are preserved from the local device
+	// on merge and never imported from a peer (see Merge).
+	AutoRefresh bool `json:"one_time_invite,omitempty"`
+	// InviteToken is the live invite secret carried by the current friend code (see
+	// AutoRefresh). Always present once an account has unlocked at least once (minted
+	// on first unlock if absent). Device-local admission bookkeeping, like
+	// PeerAliases above.
+	InviteToken string `json:"invite_token,omitempty"`
+}
+
+// RotationState persists the rotating-account-identity feature's state. The
+// current alias is the onion address we publish and hand out (as a refreshable
+// code); history holds aliases we've rotated away from but keep alive during a
+// grace window so contacts mid-handoff (and offline contacts) can still reach
+// the old address until they ack the new one.
+type RotationState struct {
+	// CurrentIndex is the alias index (m/0'/2'/CurrentIndex') currently published.
+	CurrentIndex uint32 `json:"current_index"`
+	// CurrentAccount is the account number (== onion label) of the current alias,
+	// cached so the UI/plumbing need not re-derive it every read.
+	CurrentAccount string `json:"current_account"`
+	// NextRefreshAt is when time-based auto-refresh becomes due (long-overlap /
+	// infrequent by default). Zero = no auto-refresh scheduled yet.
+	NextRefreshAt time.Time `json:"next_refresh_at,omitempty"`
+	// History holds aliases rotated away from but still within their grace window.
+	History []AliasRecord `json:"history,omitempty"`
+}
+
+// AliasRecord is a previously-current alias kept live during its grace window.
+type AliasRecord struct {
+	// Index is the alias index (m/0'/2'/Index').
+	Index uint32 `json:"index"`
+	// Account is the alias's account number / onion label.
+	Account string `json:"account"`
+	// RetireAt is the hard deadline to tear this alias's onion down (the end of
+	// its grace window), independent of whether every contact has acked.
+	RetireAt time.Time `json:"retire_at"`
+}
+
+// RotationPending is one contact's outstanding acknowledgement of a rotation we
+// pushed to them: the new alias we announced and its monotonic index (self-
+// contained so a resend needs no live RotationState lookup), plus when we queued
+// it. Resent until the contact acks, then removed.
+type RotationPending struct {
+	// NewOnion is the alias onion we announced (our current alias at queue time).
+	NewOnion string `json:"new_onion"`
+	// AliasIndex is that alias's monotonic index, echoed by the contact's ack.
+	AliasIndex uint32 `json:"alias_index"`
+	// QueuedAt is when we first enqueued this rotation for the contact.
+	QueuedAt time.Time `json:"queued_at"`
 }
 
 // PendingAccept is a friend-accept whose push has not landed yet: we accepted
@@ -574,6 +807,151 @@ func (d *Data) applyTombstones() {
 		}
 	}
 	d.Outbox = keptOut
+}
+
+// --- Prekey management methods ---
+
+// EnsurePrekeys initializes the prekey state if nil (first v2 unlock).
+// Does not generate keys — that requires the identity seed and belongs in
+// the crypto/session layer. This just ensures the struct exists.
+func (d *Data) EnsurePrekeys() {
+	if d.Prekeys == nil {
+		d.Prekeys = &PrekeyState{}
+	}
+}
+
+// GetCurrentSignedPrekey returns the active signed prekey, or nil if none exists.
+func (d *Data) GetCurrentSignedPrekey() *StoredSignedPrekey {
+	if d.Prekeys == nil {
+		return nil
+	}
+	for i := len(d.Prekeys.SignedPrekeys) - 1; i >= 0; i-- {
+		if d.Prekeys.SignedPrekeys[i].Status == "current" {
+			return &d.Prekeys.SignedPrekeys[i]
+		}
+	}
+	return nil
+}
+
+// AddSignedPrekey appends a new signed prekey and marks it as current.
+// The previous current prekey is marked as "retired" with a grace period.
+func (d *Data) AddSignedPrekey(sp StoredSignedPrekey) {
+	d.EnsurePrekeys()
+	sp.Status = "current"
+	sp.ID = d.Prekeys.NextPrekeyID
+	d.Prekeys.NextPrekeyID++
+	// Retire the previous current prekey
+	for i := range d.Prekeys.SignedPrekeys {
+		if d.Prekeys.SignedPrekeys[i].Status == "current" {
+			now := time.Now()
+			d.Prekeys.SignedPrekeys[i].Status = "retired"
+			d.Prekeys.SignedPrekeys[i].RetiredAt = &now
+		}
+	}
+	d.Prekeys.SignedPrekeys = append(d.Prekeys.SignedPrekeys, sp)
+}
+
+// GetExpiredSignedPrekeys returns signed prekeys whose grace period has expired
+// and whose private keys should be deleted.
+func (d *Data) GetExpiredSignedPrekeys(gracePeriod time.Duration) []StoredSignedPrekey {
+	if d.Prekeys == nil {
+		return nil
+	}
+	var expired []StoredSignedPrekey
+	for _, sp := range d.Prekeys.SignedPrekeys {
+		if sp.Status == "retired" && sp.RetiredAt != nil &&
+			time.Since(*sp.RetiredAt) > gracePeriod {
+			expired = append(expired, sp)
+		}
+	}
+	return expired
+}
+
+// DeleteExpiredSignedPrekeys removes retired prekeys past their grace period
+// and zeros their private keys.
+func (d *Data) DeleteExpiredSignedPrekeys(gracePeriod time.Duration) {
+	if d.Prekeys == nil {
+		return
+	}
+	expired := d.GetExpiredSignedPrekeys(gracePeriod)
+	if len(expired) == 0 {
+		return
+	}
+	expIDs := make(map[uint32]bool, len(expired))
+	for _, sp := range expired {
+		expIDs[sp.ID] = true
+		// Zero the private key before discarding
+		for i := range sp.PrivateKey {
+			sp.PrivateKey[i] = 0
+		}
+	}
+	kept := d.Prekeys.SignedPrekeys[:0]
+	for _, sp := range d.Prekeys.SignedPrekeys {
+		if !expIDs[sp.ID] {
+			kept = append(kept, sp)
+		}
+	}
+	d.Prekeys.SignedPrekeys = kept
+}
+
+// AddOneTimePrekeys appends a batch of one-time prekeys to the pool.
+func (d *Data) AddOneTimePrekeys(prekeys []StoredOneTimePrekey) {
+	d.EnsurePrekeys()
+	for _, otp := range prekeys {
+		otp.ID = d.Prekeys.NextPrekeyID
+		d.Prekeys.NextPrekeyID++
+		d.Prekeys.OneTimePrekeys = append(d.Prekeys.OneTimePrekeys, otp)
+	}
+}
+
+// ConsumeOneTimePrekey marks a prekey as consumed and returns its private key.
+// Returns nil if the prekey was already consumed or not found. The caller
+// must use the returned key immediately and not store it.
+func (d *Data) ConsumeOneTimePrekey(id uint32) []byte {
+	if d.Prekeys == nil {
+		return nil
+	}
+	for i := range d.Prekeys.OneTimePrekeys {
+		if d.Prekeys.OneTimePrekeys[i].ID == id && !d.Prekeys.OneTimePrekeys[i].Consumed {
+			d.Prekeys.OneTimePrekeys[i].Consumed = true
+			priv := d.Prekeys.OneTimePrekeys[i].PrivateKey
+			// Zero the stored private key before discarding — defense in depth.
+			for j := range d.Prekeys.OneTimePrekeys[i].PrivateKey {
+				d.Prekeys.OneTimePrekeys[i].PrivateKey[j] = 0
+			}
+			d.Prekeys.OneTimePrekeys[i].PrivateKey = nil
+			return priv
+		}
+	}
+	return nil
+}
+
+// CleanupConsumedOneTimePrekeys removes consumed one-time prekeys from the pool.
+func (d *Data) CleanupConsumedOneTimePrekeys() {
+	if d.Prekeys == nil {
+		return
+	}
+	kept := d.Prekeys.OneTimePrekeys[:0]
+	for _, otp := range d.Prekeys.OneTimePrekeys {
+		if !otp.Consumed {
+			kept = append(kept, otp)
+		}
+	}
+	d.Prekeys.OneTimePrekeys = kept
+}
+
+// UnusedOneTimePrekeys returns the count of unconsumed one-time prekeys.
+func (d *Data) UnusedOneTimePrekeys() int {
+	if d.Prekeys == nil {
+		return 0
+	}
+	n := 0
+	for _, otp := range d.Prekeys.OneTimePrekeys {
+		if !otp.Consumed {
+			n++
+		}
+	}
+	return n
 }
 
 // Merge combines two devices' state into one, deterministically and
@@ -774,7 +1152,76 @@ func Merge(a, b *Data) *Data {
 			}
 		}
 	}
+	out.Rotation = mergeRotation(a.Rotation, b.Rotation)
+
+	// Device-local crypto/delivery state is preserved from `a` (the local device —
+	// both call sites pass s.snapshotLocked() first) and `b`'s copy is NEVER
+	// imported. These are per-device: another device's ratchet sessions, prekeys,
+	// unacked inits and rotation-delivery bookkeeping belong to ITS ratchets, and
+	// adopting them here would fork sessions or reserve the wrong one-time prekeys.
+	// The result of Merge is adopted wholesale (sync.go), so without this the adopt
+	// would WIPE the local device's live sessions and the peer-alias tolerance map
+	// on every sync — Merge writes none of these otherwise. Rotation (above) is the
+	// exception: it IS cross-device state (which alias index is current) and merges.
+	out.Prekeys = a.Prekeys
+	out.RatchetSessions = a.RatchetSessions
+	out.PendingInits = a.PendingInits
+	out.ProcessedInits = a.ProcessedInits
+	out.PendingRotations = a.PendingRotations
+	out.PeerAliases = a.PeerAliases
+	// Invite-code state is device-local too: friend requests land on the publishing
+	// device, so a secondary's stale (or empty) token must never clobber the live one
+	// the primary is handing out and rotating.
+	out.AutoRefresh = a.AutoRefresh
+	out.InviteToken = a.InviteToken
+
 	out.applyTombstones()
+	return out
+}
+
+// mergeRotation reconciles rotation state across two devices. Rotation is
+// forward-only (the index only ever increases), so the higher CurrentIndex wins
+// as the current alias; alias histories are unioned by index (keeping the later
+// RetireAt) so no still-live old alias is dropped just because the other device
+// hadn't recorded it. Returns nil only when neither side has rotated yet.
+func mergeRotation(a, b *RotationState) *RotationState {
+	if a == nil {
+		return b
+	}
+	if b == nil {
+		return a
+	}
+	cur, other := a, b
+	if b.CurrentIndex > a.CurrentIndex {
+		cur, other = b, a
+	}
+	out := &RotationState{
+		CurrentIndex:   cur.CurrentIndex,
+		CurrentAccount: cur.CurrentAccount,
+		NextRefreshAt:  cur.NextRefreshAt,
+	}
+	byIdx := map[uint32]AliasRecord{}
+	for _, src := range [][]AliasRecord{a.History, b.History} {
+		for _, r := range src {
+			if ex, ok := byIdx[r.Index]; !ok || r.RetireAt.After(ex.RetireAt) {
+				byIdx[r.Index] = r
+			}
+		}
+	}
+	// The loser's current alias is, from the winner's view, a retired alias still
+	// in play — fold it into history so it isn't lost.
+	if other.CurrentIndex != cur.CurrentIndex && other.CurrentAccount != "" {
+		if _, ok := byIdx[other.CurrentIndex]; !ok {
+			byIdx[other.CurrentIndex] = AliasRecord{Index: other.CurrentIndex, Account: other.CurrentAccount}
+		}
+	}
+	for idx, r := range byIdx {
+		if idx == out.CurrentIndex {
+			continue // the current alias is not "history"
+		}
+		out.History = append(out.History, r)
+	}
+	sort.SliceStable(out.History, func(i, j int) bool { return out.History[i].Index < out.History[j].Index })
 	return out
 }
 
@@ -873,19 +1320,17 @@ func migrate(from, to int, d *Data) error {
 	return nil
 }
 
-// migrate1to2 is the RESERVED v1->v2 store migration. It is locked in now though
-// fileVersion is still 1, so it is unreachable in production (migrate's ceiling is
-// fileVersion) — the analog of protocol's reserved sigContextFor(2). It exists so
-// the migration pipeline is proven end-to-end by a durable dry-run before the first
-// real v2 lands, and so the transform's shape (and its content-preservation) is
-// locked against silent drift. The delta is deliberately trivial and lossless:
-// canonicalize the tombstone list by sorting it. Deleted is an unordered set of
-// message IDs, so ordering carries no meaning and sorting drops nothing — but a
-// careless reimplementation that lost an entry would resurrect a deleted message on
-// the next sync, which is exactly the data-loss class the dry-run's fidelity test
-// guards. The commit that ships a real v2 raises fileVersion to make this reachable.
+// migrate1to2 transitions the store from v1 to v2. The v2 format adds the
+// Prekeys field for the Double Ratchet protocol. On upgrade from v1:
+//   - Tombstones are canonicalized by sorting (existing behavior).
+//   - Prekeys is left nil/empty — the application layer generates the initial
+//     signed prekey and one-time prekey pool on first unlock after upgrade.
+//     This is deliberate: the BIP39 seed is needed for key generation, which
+//     is only available at unlock time, not during store migration.
 func migrate1to2(d *Data) {
 	sort.Strings(d.Deleted)
+	// Prekeys field is nil by default after unmarshal; the app layer detects
+	// nil and generates initial prekey material on first v2 unlock.
 }
 
 // Save encrypts and atomically writes the data with owner-only permissions.

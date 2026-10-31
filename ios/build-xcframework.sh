@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 #
-# Build the Molepipe.xcframework that the iOS app consumes. This wraps the Go
+# Build the Mobile.xcframework that the iOS app consumes. This wraps the Go
 # backend (backend/mobile) into an XCFramework via gomobile bind.
+#
+# The framework MUST be named after the Go package (mobile -> "Mobile"): gomobile
+# derives the Swift module name and the symbol prefix from the -o basename, and
+# the Swift shell does `import Mobile` / calls MobileStart(...). It must NOT be
+# named "Molepipe" — that is the app target's own module name, and the two would
+# collide.
 #
 # Prerequisites (macOS only):
 #   - The Rust static libraries must already be built (run ios/build-torhost.sh)
@@ -10,11 +16,11 @@
 #       go install golang.org/x/mobile/cmd/gobind@latest
 #       gomobile init
 #
-# Output: ios/Molepipe.xcframework
+# Output: ios/Mobile.xcframework
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
-output="$repo_root/ios/Molepipe.xcframework"
+output="$repo_root/ios/Mobile.xcframework"
 
 export PATH="$(go env GOPATH)/bin:$PATH"
 

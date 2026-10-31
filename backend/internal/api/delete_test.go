@@ -18,7 +18,7 @@ func friendedPair(t *testing.T) (sA, sB *Server, accA, accB, tokA, tokB string) 
 	t.Helper()
 	sA, sB, accA, accB, tokA, tokB, bOnion := newPair(t)
 	bOnion.up.Store(true)
-	if r := sA.do(t, "POST", "/api/friend-requests/send", `{"account":"`+accB+`"}`, authHdr(sA, tokA)); r.Code != http.StatusOK {
+	if r := sA.do(t, "POST", "/api/friend-requests/send", `{"account":"`+codeOf(t, sB, tokB)+`"}`, authHdr(sA, tokA)); r.Code != http.StatusOK {
 		t.Fatalf("send request: %d (%s)", r.Code, r.Body)
 	}
 	if r := sB.do(t, "POST", "/api/friend-requests/accept", `{"account":"`+accA+`"}`, authHdr(sB, tokB)); r.Code != http.StatusOK {

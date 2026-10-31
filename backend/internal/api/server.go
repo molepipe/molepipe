@@ -25,11 +25,13 @@ import (
 	"unicode"
 
 	"github.com/molepipe/molepipe/backend/internal/chatstore"
+	"github.com/molepipe/molepipe/backend/internal/crypto"
 	"github.com/molepipe/molepipe/backend/internal/device"
 	"github.com/molepipe/molepipe/backend/internal/identity"
 	"github.com/molepipe/molepipe/backend/internal/mailbox"
 	"github.com/molepipe/molepipe/backend/internal/pin"
 	"github.com/molepipe/molepipe/backend/internal/protocol"
+	"github.com/molepipe/molepipe/backend/internal/session"
 	"github.com/molepipe/molepipe/backend/internal/tor"
 	"github.com/molepipe/molepipe/backend/internal/unlockguard"
 	"github.com/molepipe/molepipe/backend/internal/version"
@@ -125,6 +127,14 @@ type Server struct {
 	// notification. Set once at construction, needs no lock.
 	onFriendRequest func(fromName string)
 
+	// onFriendAccept, if set, is called asynchronously when someone we sent a
+	// friend request to accepts it. The flip from "Requested" to a real
+	// conversation is otherwise silent — the requester has nothing to look at
+	// unless they happen to have the list open — so the shell posts a system
+	// notification for it just as it does for an inbound request. Set once at
+	// construction, needs no lock.
+	onFriendAccept func(fromName string)
+
 	// onGroupInvite, if set, is called asynchronously when a new inbound group
 	// invite arrives. The Android shell uses it to post a system notification.
 	// Set once at construction, needs no lock.
@@ -143,25 +153,30 @@ type Server struct {
 	// session token. Read them only through currentDevice/currentPin/currentGuard.
 	// It is NOT sessMu: reloadDeviceState is reached via haltForWipe→clearSession,
 	// which already holds sessMu, so sharing it would deadlock.
-	devMu  sync.RWMutex
-	device *device.Config     // local per-device state (role + device key)
-	pin    *pin.Store         // device-bound PIN unlock shortcut (nil = unavailable)
-	guard  *unlockguard.Store // password-unlock backoff + optional erase-after-N (nil = unavailable)
-	relay     *mailbox.Store     // blobs we hold-and-forward for friends (friend-relay)
-	relayQuota *relaySenderQuota // per-sender relay drop-off quota (abuse prevention)
+	devMu      sync.RWMutex
+	device     *device.Config     // local per-device state (role + device key)
+	pin        *pin.Store         // device-bound PIN unlock shortcut (nil = unavailable)
+	guard      *unlockguard.Store // password-unlock backoff + optional erase-after-N (nil = unavailable)
+	relay      *mailbox.Store     // blobs we hold-and-forward for friends (friend-relay)
+	relayQuota *relaySenderQuota  // per-sender relay drop-off quota (abuse prevention)
 
 	// Messaging session state, live only while unlocked.
 	sessMu       sync.Mutex
-	sessID       *identity.Identity           // the unlocked identity, for signing group rosters off the request path
-	myAccount    string                       // our own account number (for the sync gate)
-	displayName  string                       // our own display name
-	mailboxURL   string                       // our own mailbox address (disclosed to accepted contacts, not in the public card)
-	avatarHash   string                       // sha256 hex of our own avatar image, "" = none (advertised in the public card)
-	profileAt    time.Time                    // profile last-updated time (for sync LWW)
-	backupBudget int64                        // byte budget for group-image backup to our own mailbox (0 = off)
-	contacts     map[string]chatstore.Contact // account number -> contact (with status)
-	messages     []chatMessage
-	groups       map[string]chatstore.Group // group id -> group (roster + policy); group chat
+	sessID       *identity.Identity // the unlocked identity, for signing group rosters off the request path
+	myAccount    string             // our own account number (for the sync gate)
+	displayName  string             // our own display name
+	mailboxURL   string             // our own mailbox address (disclosed to accepted contacts, not in the public card)
+	avatarHash   string             // sha256 hex of our own avatar image, "" = none (advertised in the public card)
+	profileAt    time.Time          // profile last-updated time (for sync LWW)
+	backupBudget int64              // byte budget for group-image backup to our own mailbox (0 = off)
+	// mediaAutoSave is the GLOBAL default for copying a received image out of the
+	// encrypted attachment store into the phone's gallery. Per-contact overrides
+	// live on the Contact; this is only the fallback they inherit. Mirrors
+	// chatstore.Profile.MediaAutoSave, loaded/persisted with the rest of Profile.
+	mediaAutoSave bool
+	contacts      map[string]chatstore.Contact // account number -> contact (with status)
+	messages      []chatMessage
+	groups        map[string]chatstore.Group // group id -> group (roster + policy); group chat
 	// groupReactCursor rotates the starting offset of the reaction re-serve window
 	// per group across successive sync pulls, so a group with more than
 	// groupSyncMaxReactions reaction events in its window doesn't re-serve the same
@@ -183,7 +198,80 @@ type Server struct {
 	deleted []string
 	// outbox holds messages accepted but not yet delivered, keyed by message ID.
 	// Drained by outboxLoop.
-	outbox      map[string]chatstore.OutboxItem
+	outbox map[string]chatstore.OutboxItem
+	// prekeys is our v2 prekey material (signed + one-time), loaded on unlock and
+	// topped up by ensurePrekeysLocked. Guarded by sessMu.
+	prekeys *chatstore.PrekeyState
+	// ratchetSessions persists established Double Ratchet sessions, keyed by peer
+	// account, each value a JSON session.SessionState. Guarded by sessMu; the
+	// session.Manager's persistence callbacks read/write it and then persist.
+	ratchetSessions map[string][]byte
+	// pendingInits holds, per peer account, an X3DH init envelope awaiting the
+	// peer's acknowledgement, as a JSON pendingInit blob. While an entry is
+	// present the initiator resends that exact envelope instead of minting a new
+	// one, and does not treat the session as usable for ordinary messages — this
+	// is what stops a failed first handshake from poisoning the session. Guarded
+	// by sessMu.
+	pendingInits map[string][]byte
+	// processedInits records, per peer account, the signature of the last X3DH
+	// init we processed from that peer, so an ack-lost resend of the same init is
+	// recognised and acked idempotently even after its one-time prekey has been
+	// cleaned up. Guarded by sessMu.
+	processedInits map[string][]byte
+	// rotation holds the rotating-account-identity state (current alias index +
+	// account, next auto-refresh, grace-window history). Nil until the first alias
+	// is minted. Guarded by sessMu; persisted in chatstore.Data.Rotation.
+	rotation *chatstore.RotationState
+	// pendingRotations is the ack-driven, resend-until-acked set of our rotations a
+	// contact has not yet acked, keyed by the contact's current account. Guarded by
+	// sessMu; persisted in chatstore.Data.PendingRotations (device-local, not merged).
+	pendingRotations map[string]chatstore.RotationPending
+	// peerAliases maps a contact's retired alias account to the account we currently
+	// know that contact by, so an ack-lost resend of their AddressRotation (still
+	// addressed from the old alias, since the sender resends over the old-alias
+	// channel until acked) resolves back to the migrated contact instead of being
+	// rejected as an unknown sender. Guarded by sessMu; persisted in
+	// chatstore.Data.PeerAliases (device-local, not merged). See resolvePeerAccountLocked.
+	peerAliases map[string]string
+	// autoRefresh / inviteToken back the always-on invite-code feature. inviteToken
+	// is the live secret carried in the shareable friend code (always present once
+	// unlocked); a new friend request MUST present the current token to be admitted.
+	// autoRefresh controls what happens after a successful redemption: on → rotate
+	// the token (single-use, self-renewing); off → keep it (reusable until a manual
+	// refresh). Guarded by sessMu; persisted in chatstore.Data (device-local, not
+	// merged — friend requests land on the publishing device). See
+	// hookOnFriendRequest and handleInviteCode.
+	autoRefresh bool
+	inviteToken string
+	// localAliasAccounts are the alias onion accounts we are CURRENTLY publishing
+	// beyond our primary account (during a rotation grace window). A contact who has
+	// not yet applied our rotation still dials us at an alias-of-us and signs/AAD-binds
+	// their messages to it, so the receive path must recognise any of these as a valid
+	// recipient identity, not just the primary. Empty until we start rotating; managed
+	// by setLiveAliasAccountsLocked (which also pushes the set to the peer receive
+	// path). Guarded by sessMu; NOT persisted — it is rebuilt from live services.
+	localAliasAccounts []string
+	// aliasServiceIDs maps a live alias onion account to the extra-service id that
+	// currently publishes it, so the grace sweeper can tear one down by id. Runtime
+	// only — extra-service ids are not stable across a restart, so this is NEVER
+	// persisted; it is rebuilt by republishing the live set at unlock (see
+	// prepareLiveAliasesLocked / publishPreparedAliases). Guarded by sessMu.
+	aliasServiceIDs map[string]uint64
+	// aliasSigningKeys maps a live alias onion account to its Ed25519 signing key,
+	// so the send path can stamp AND sign an outbound message as the alias a
+	// contact currently knows us by (Contact.MyAccountKnown) without re-deriving
+	// from the mnemonic per message — the peer derives our verifying key FROM the
+	// Sender string, so stamping an alias requires signing with that alias's key.
+	// The primary account is NOT stored here (its key is idn.Keys.Signing, always
+	// available); only rotation aliases. Membership mirrors aliasServiceIDs (the
+	// live set): populated where an alias key is derived (performRotationLocked,
+	// prepareLiveAliasesLocked) and dropped when the grace sweeper tears its
+	// service down. Sensitive key material — runtime only, NEVER persisted, and
+	// zeroed in clearSession (where the mnemonic is also gone). Guarded by sessMu.
+	aliasSigningKeys map[string]crypto.SigningKeyPair
+	// sessMgr manages live Double Ratchet sessions for v2 peers. Nil while locked;
+	// set at unlock and injected into the peer for the receive path.
+	sessMgr     *session.Manager
 	peer        *protocol.Peer
 	chat        *chatstore.Store           // encrypted persistence, nil while locked
 	attach      *chatstore.AttachmentStore // encrypted image blobs, nil while locked
@@ -198,14 +286,37 @@ type Server struct {
 	avatarLimiter *tokenBucket
 
 	presence map[string]string // account -> last-known presence state (online/mailbox/offline)
+	// helloRejects counts presence hellos that arrived but failed verification;
+	// helloRejectFlush is the unix second of the last rollup logged. Flushed at
+	// most once a minute (see rollupHelloReject) because /p2p/profile is public
+	// and unauthenticated — a line per attempt would hand anyone on Tor a
+	// log-flooding lever. Process-lifetime, like avatarLimiter.
+	//
+	// The count is the signal worth having in the field: presence still stuck
+	// WITH rejects means hellos are arriving and being thrown out (a clock more
+	// than helloSkew off, or a replay), which is a different fault from presence
+	// stuck with no rejects at all — nobody is announcing, or nobody can reach us.
+	helloRejects     atomic.Int64
+	helloRejectFlush atomic.Int64
 	// mailboxCheckedAt is session-local (NOT synced/persisted): the last time we
 	// pulled a contact's mailbox from their gated contact-profile endpoint. Bounds
 	// how often the presence sweep re-fetches it, since the mailbox rarely changes
 	// and each fetch is an extra Tor round-trip.
 	mailboxCheckedAt map[string]time.Time
-	sessionCancel    context.CancelFunc // stops the background presence + mailbox loops on lock
-	syncNonces       *syncNonceJar      // single-use nonces for the /sync + /pair gates
-	pairSecrets      *syncNonceJar      // short-lived single-use device-pairing secrets
+	// helloAt is session-local (NOT synced/persisted): when a verified presence
+	// hello last arrived from each contact. Read by the sweep to decide whether a
+	// failed outbound probe should still be reported as online — see
+	// helloStickiness. Keyed by account, so it migrates on rotation like presence.
+	helloAt map[string]time.Time
+	// probeBackoff is session-local (NOT synced/persisted): per-contact
+	// consecutive-probe-failure streaks, used by the sweep to stop dialing a
+	// contact who is simply offline on every single pass — see probeBackoffMax.
+	// Session-local on purpose: an unlock starts every contact at full cadence,
+	// so the backoff can never delay the first sweep after the user comes back.
+	probeBackoff  map[string]probeBackoffEntry
+	sessionCancel context.CancelFunc // stops the background presence + mailbox loops on lock
+	syncNonces    *syncNonceJar      // single-use nonces for the /sync + /pair gates
+	pairSecrets   *syncNonceJar      // short-lived single-use device-pairing secrets
 	// attachNeed carries, across attachment-sync ticks, the image ids the primary
 	// last told this (secondary) device it is missing, so the next tick pushes
 	// their blobs. Written only by the sync loop goroutine but read/reset under
@@ -231,6 +342,43 @@ type Server struct {
 	// finishUnlock. Nil when no watchdog is running (locked, or Tor disabled).
 	publishWatchdogCancel context.CancelFunc
 	publishWatchdogMu     sync.Mutex
+
+	// Publish-watchdog timings, set to the defaults in New. Fields rather than
+	// constants only so a test can shrink them; nothing writes them once the
+	// watchdog goroutine is running. watchdogPublishTimeout is the budget for
+	// the FIRST publish attempt; each restart doubles it up to
+	// watchdogMaxPublishTimeout (see publishBudget).
+	watchdogPollInterval      time.Duration
+	watchdogPublishTimeout    time.Duration
+	watchdogMaxPublishTimeout time.Duration
+	watchdogDialWaitTimeout   time.Duration
+	watchdogMaxRestarts       int
+	// watchdogMaxPublishWait bounds the state veto below, per attempt: however
+	// healthy the service claims to be, an attempt whose publish has not landed
+	// within this is treated as stuck and restarted. Without it a service wedged in
+	// "bootstrapping" forever would never be restarted, which is a regression
+	// against the timer-only behaviour the veto replaces.
+	watchdogMaxPublishWait time.Duration
+
+	// lastPeerHit is the Unix-nano time a request last arrived on the
+	// onion-facing listener, i.e. the last time a peer actually reached us
+	// through Tor. The publish watchdog reads it as positive proof that our
+	// descriptor is serving even when Arti's Ready() says otherwise.
+	lastPeerHit atomic.Int64
+
+	// reachProven latches true once the CURRENT publication has been shown to
+	// be reachable — by a peer arriving on the onion listener, or by Arti
+	// reporting Ready() itself. Unlike lastPeerHit it does not decay: see
+	// reachable() for why publication is a latched fact rather than a
+	// recent-activity measure. Cleared by forgetReachEvidence().
+	reachProven atomic.Bool
+
+	// publishConfirmed latches true once Arti has itself reported Ready() for
+	// the CURRENT publication, i.e. its whole batch of HSDir uploads resolved
+	// at least once. Strictly narrower than reachProven, which also latches on
+	// a peer arriving: see publishedOnce() for why the announcing gate needs
+	// the narrow one. Cleared by forgetReachEvidence().
+	publishConfirmed atomic.Bool
 }
 
 // New creates a server backed by the given identity store. onion is the Tor
@@ -278,6 +426,32 @@ func New(store *identity.Store, onion tor.OnionService) *Server {
 		log.Printf("control token: %v (the /api surface will refuse all requests until restart)", err)
 	}
 	srv := &Server{store: store, vault: newVault(), onion: onion, device: dev, pin: pinStore, guard: guard, relay: relay, relayQuota: newRelaySenderQuota(), syncNonces: newSyncNonceJar(), pairSecrets: newSyncNonceJar(), controlToken: ctok, avatarLimiter: newTokenBucket(avatarServeRate, avatarServeBurst)}
+	// Install the session-expiry teardown before anything can serve a request,
+	// so vault.onExpire needs no locking of its own. An expired session must
+	// take the same path as an explicit Log out: see vault.get.
+	srv.vault.onExpire = srv.LockNow
+	srv.watchdogPollInterval = 5 * time.Second
+	// 90s was the first-publish budget and it was too tight: a phone log caught
+	// the watchdog restarting twice and then abandoning a cold start, while
+	// another run on the same device took 69s just to reach its first inbound
+	// peer request and still had Ready() false at the 90s mark. Publishing a
+	// descriptor over a mobile link is routinely slower than that, and getting
+	// this wrong is asymmetric — waiting too long leaves us offline a while
+	// longer before a restart that may not have been needed, whereas restarting
+	// too early destroys a publish that was about to land.
+	srv.watchdogPublishTimeout = 4 * time.Minute
+	srv.watchdogMaxPublishTimeout = 10 * time.Minute
+	// Bootstrap has to finish before a publish can even start, and on a cold
+	// mobile start that is minutes, not seconds. Overrunning this is not
+	// destructive — the watchdog just stops watching — but an absent watchdog
+	// is a silent loss of the recovery it exists to provide.
+	srv.watchdogDialWaitTimeout = 5 * time.Minute
+	srv.watchdogMaxRestarts = 2
+	// Generous against the slowest publish actually measured on hardware —
+	// 10m38s on a phone whose circuit builds were timing out about a third of
+	// the time. This is the backstop for a service that lies about making
+	// progress, not a budget anything is expected to reach.
+	srv.watchdogMaxPublishWait = 30 * time.Minute
 	srv.runningVersionCode.Store(-1) // "not injected"; the handler falls back to version.Code() on desktop, fails closed on Android
 	return srv
 }
@@ -339,6 +513,9 @@ func (s *Server) Start(addr string) (string, error) {
 	pubMux.HandleFunc(protocol.AttachmentPath, s.handleP2PAttachment)
 	pubMux.HandleFunc(protocol.ContactProfilePath, s.handleP2PContactProfile)
 	pubMux.HandleFunc(protocol.AvatarPath, s.handleP2PAvatar)
+	pubMux.HandleFunc(protocol.PrekeyBundlePath, s.handleP2PPrekeyBundle)
+	pubMux.HandleFunc(protocol.RatchetInitPath, s.handleP2PRatchetInit)
+	pubMux.HandleFunc(protocol.RatchetMessagePath, s.handleP2PRatchetMessage)
 	pubMux.HandleFunc(protocol.GroupInvitePath, s.handleP2PGroupInvite)
 	pubMux.HandleFunc(protocol.GroupInviteAcceptPath, s.handleP2PGroupInviteAccept)
 	// Multi-device sync (gated by SyncVerify: identity key + enrolled device).
@@ -357,7 +534,7 @@ func (s *Server) Start(addr string) (string, error) {
 	pubMux.HandleFunc(protocol.RelayRequestPath, s.handleP2PRelayRequest)
 	pubMux.HandleFunc(protocol.RelayAcceptPath, s.handleP2PRelayAccept)
 	s.pubSrv = &http.Server{
-		Handler:           recoverPanic(logRequests(limitInFlight(maxPublicInFlight, pubMux))),
+		Handler:           recoverPanic(logRequests(s.notePeerTraffic(limitInFlight(maxPublicInFlight, pubMux)))),
 		ReadHeaderTimeout: 5 * time.Second,
 		// The onion-facing listener is reachable by anyone on Tor, and several of
 		// its handlers must read (and allocate) a request body before they can
@@ -394,13 +571,54 @@ func (s *Server) PublicAddr() string { return s.publicAddr() }
 // "localhost") so the browser can't resolve to ::1 while we listen on IPv4.
 func (s *Server) URL() string { return "http://127.0.0.1:" + s.port }
 
+// Port is the loopback port Start bound, as a string. Exported so a shell can
+// persist it and ask for the same one next time: the WebView's localStorage is
+// keyed by origin, and the origin includes the port (see mobile.Start).
+func (s *Server) Port() string { return s.port }
+
 // TorServing reports whether the onion service is unlocked and reachable — i.e.
-// actively hosting, so peers can reach us. The Android foreground service polls
-// this to hold a CPU wakelock ONLY while Tor genuinely needs to run (unlocked +
-// published), rather than for the whole service lifetime — a locked app hosts no
-// onion, so a wakelock then would be pure battery waste.
+// actively hosting, so peers can reach us.
+//
+// Built on reachable() rather than onion.Ready() directly, because "is Tor
+// serving" is a latched question and Ready() is a live one. Arti reports
+// Bootstrapping for a routine descriptor REUPLOAD on a service that is still
+// published (see spawn_status_watch in torhost), and Ready() is false in
+// Bootstrapping — one phone logged 24 such dips in 12 minutes while serving
+// peers throughout. Anything deciding power policy off a live read would
+// therefore flip tens of times an hour on a healthy service. reachable() drops
+// the latch where the evidence genuinely dies (Broken/Shutdown, via
+// NeedsRestart), which is exactly when we have stopped serving.
+//
+// No caller today, and the comment this replaces explains why that went
+// unnoticed: it claimed the Android foreground service polls this for its CPU
+// wakelock. It does not and never did — BackendService.kt acquires the wakelock
+// once in onCreate() and holds it for the whole service lifetime. Kept as shell
+// binding API, latched rather than live so the next caller does not inherit the
+// dip problem. For the dormant-mode gate specifically see DormantAllowed, which
+// asks a deliberately narrower question.
 func (s *Server) TorServing() bool {
-	return s.vault.unlocked() && s.onion != nil && s.onion.Ready()
+	return s.vault.unlocked() && s.reachable()
+}
+
+// DormantAllowed reports whether it is safe to put the Tor client into dormant
+// mode, i.e. whether our own descriptor publication has completed at least once
+// since the last republish. Dormant mode suspends preemptive circuit building
+// and directory fetches, which is exactly the work an unfinished publish needs.
+//
+// Deliberately narrower than TorServing/reachable(), which also latch on a peer
+// arriving. A peer can reach us off a descriptor published in a PREVIOUS session
+// — HS descriptors live 3 hours and intro points stay established — while this
+// session's publisher is still retrying HSDir uploads. One device on 2026-10-20
+// was in exactly that state: DegradedUnreachable with 14 failed upload attempts,
+// serving a peer every ~30s off the old descriptor. Gating on reachability there
+// would suspend the circuit building the retry depends on, which is the one
+// situation this gate exists to prevent.
+//
+// publishedOnce() is cleared by forgetReachEvidence() at every teardown and
+// republish, so dormant mode defers again through each republish. That is
+// intended, not an oversight: a republish is an unfinished publish.
+func (s *Server) DormantAllowed() bool {
+	return s.vault.unlocked() && s.publishedOnce()
 }
 
 // OnionHost returns the underlying Tor service, allowing the mobile layer to
@@ -459,6 +677,46 @@ func (s *Server) startOnion(onionKey tor.OnionKey) error {
 	if s.cancelGrace() {
 		return nil
 	}
+	// Second reuse path, for every way back in here that does NOT go through a
+	// lock-grace: a session that idled out, or a UI that lost its session token
+	// to an Activity/WebView restart and sent the user back to the lock screen
+	// while the service kept running. Both land on an unlock with no grace
+	// armed, and the old code then tore down a service that was already
+	// published under this exact key and spent 25s (emulator) to 90s+ (phone)
+	// rebuilding the identical descriptor — discarding its established intro
+	// points and both HSDir rings to arrive back where it started.
+	//
+	// Gated on IsPrimary because only the primary may publish the account
+	// onion: a device demoted to secondary while published must still fall
+	// through and stop. Keyed on the public key, not on "is anything running",
+	// because re-unlocking the same account is not the only caller — a duress
+	// decoy (handleDuress), a restore and a pairing all reach startOnion with a
+	// different identity in the same process, and those must republish.
+	//
+	// Safe to keep the old service's port mapping because the host only ever
+	// reports a service it is running itself, in this process, and the
+	// onion-facing listener it forwards to is created once in Start and lives
+	// until Shutdown — a lock/unlock never moves it. A service inherited across
+	// a process boundary could not make that promise.
+	if s.currentDevice().IsPrimary() {
+		type servingKeyer interface {
+			ServingKey() (pub [32]byte, onion string, running bool)
+		}
+		if sk, ok := s.onion.(servingKeyer); ok {
+			if pub, addr, running := sk.ServingKey(); running && addr != "" && pub == onionKey.Public {
+				// Same service, still published: the reach evidence describes a
+				// descriptor that is still out there, so it survives — the same
+				// reasoning as the grace path above.
+				s.onionMu.Lock()
+				s.onionAddr = addr
+				s.onionMu.Unlock()
+				return nil
+			}
+		}
+	}
+	// Past the reuse paths every branch below tears the service down and
+	// re-publishes, so hits against the old one are no longer evidence.
+	s.forgetReachEvidence()
 	// Only the primary device publishes the account onion — a secondary
 	// publishing the same key would collide with it on the Tor HSDir hashring.
 	// But it must still run Tor: the SOCKS proxy Arti provides is what carries
@@ -510,19 +768,67 @@ func (s *Server) stopOnion() {
 	if s.onion == nil {
 		return
 	}
+	s.forgetReachEvidence()
 	s.onion.Stop()
 	s.onionMu.Lock()
 	s.onionAddr = ""
 	s.onionMu.Unlock()
 }
 
+// publishBudget is how long the watchdog gives attempt n (0-based) for the
+// descriptor to publish before treating the service as stuck. It grows with
+// each restart, for two reasons. A restart leaves the service colder than it
+// found it — the intro points and descriptor-signing keys are gone, so the next
+// publish starts from scratch — which means giving attempt n+1 the same budget
+// that attempt n just failed with asks it to do strictly more work in the same
+// time. And a device slow enough to miss the first budget is, usually, just a
+// slow device: doubling finds out, where a fixed budget only produces the
+// cascade of restart-and-fail-again the phone log showed. Capped so the last
+// attempt is still bounded.
+func (s *Server) publishBudget(attempt int) time.Duration {
+	d := s.watchdogPublishTimeout
+	for i := 0; i < attempt && d < s.watchdogMaxPublishTimeout; i++ {
+		d *= 2
+	}
+	if d > s.watchdogMaxPublishTimeout {
+		return s.watchdogMaxPublishTimeout
+	}
+	return d
+}
+
+// serviceState asks the Tor implementation for its own view of the onion
+// service's publication state, reporting whether the answer is usable.
+//
+// Optional interface rather than a method on tor.OnionService: only the Arti
+// library binding (Android/iOS) can answer. The desktop sidecar infers
+// readiness from scraping arti's log and has nothing to report, and the nil
+// stub has no service at all. Both of those — and an arti state this build
+// doesn't recognise — come back known=false, which callers must treat as "no
+// information" and fall back on, never as either answer.
+func (s *Server) serviceState() (st tor.ServiceState, known bool) {
+	type stateReporter interface{ ServiceState() tor.ServiceState }
+	sr, ok := s.onion.(stateReporter)
+	if !ok {
+		return tor.StateUnknown, false
+	}
+	st = sr.ServiceState()
+	return st, st != tor.StateUnknown
+}
+
 // startPublishWatchdog monitors the onion service after startOnion. If the
-// service stays in "publishing" (Dialable but not Ready) for longer than
-// publishTimeout, it restarts the onion service. This recovers from a stuck
+// service stays in "publishing" (Dialable but not Ready) past the attempt's
+// publishBudget, it restarts the onion service. This recovers from a stuck
 // descriptor publication where Arti's service state never reaches
 // Running/DegradedReachable. Cancelled automatically on lock via
 // cancelPublishWatchdog.
-func (s *Server) startPublishWatchdog() {
+//
+// onionKey is the key the restart republishes under, derived by the caller
+// while the identity was still guaranteed live — the watchdog must not derive
+// it itself. onionKeyFor reads zeroable key material, and the watchdog outlives
+// unlock by minutes: a lock, an idle timeout or a duress wipe can zero the
+// identity's seed while that read is in flight. The key is deterministic from
+// the identity, so reusing the caller's is equivalent to re-deriving it.
+func (s *Server) startPublishWatchdog(onionKey tor.OnionKey) {
 	if s.onion == nil {
 		return
 	}
@@ -534,15 +840,11 @@ func (s *Server) startPublishWatchdog() {
 	s.publishWatchdogCancel = cancel
 	s.publishWatchdogMu.Unlock()
 
-	const (
-		pollInterval    = 5 * time.Second
-		publishTimeout  = 90 * time.Second
-		dialWaitTimeout = 120 * time.Second
-		maxRetries      = 2
-	)
-
 	go func() {
 		defer cancel()
+		// Our own copy of the key, so scrub it on the way out rather than
+		// leaving onion secrets resident for as long as this goroutine lives.
+		defer onionKey.Zeroize()
 		// Wait for bootstrap to finish (Dialable) — no point checking Ready
 		// before we can even send.
 		dialWaited := time.Duration(0)
@@ -550,33 +852,109 @@ func (s *Server) startPublishWatchdog() {
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(pollInterval):
+			case <-time.After(s.watchdogPollInterval):
 			}
-			dialWaited += pollInterval
-			if dialWaited > dialWaitTimeout {
-				log.Printf("publish watchdog: gave up waiting for dialable after %v", dialWaitTimeout)
+			dialWaited += s.watchdogPollInterval
+			if dialWaited > s.watchdogDialWaitTimeout {
+				log.Printf("publish watchdog: gave up waiting for dialable after %v", s.watchdogDialWaitTimeout)
 				return
 			}
 		}
-		// Now poll Ready(). If it doesn't go true within publishTimeout,
-		// restart the onion service (up to maxRetries times).
-		for attempt := 0; attempt <= maxRetries; attempt++ {
+		// Now poll Ready(). If it doesn't go true within this attempt's
+		// publishBudget, restart the onion service (up to
+		// s.watchdogMaxRestarts times).
+		// A counter per veto, not one shared: the throttle below only prints the
+		// 1st and then every 10th, so a shared counter lets the peer-traffic
+		// veto's firing swallow the state veto's first line entirely — and that
+		// line is the one that explains why a restart didn't happen.
+		peerSuppressed, stateSuppressed := 0, 0
+		for attempt := 0; ; attempt++ {
+			budget := s.publishBudget(attempt)
 			publishStart := time.Now()
+			// Unlike publishStart, this is not reset by a veto: it is what the
+			// max-publish-wait ceiling is measured against, so a veto that
+			// keeps firing cannot postpone the restart forever.
+			attemptStart := publishStart
+			log.Printf("publish watchdog: monitoring onion publication (attempt %d/%d, budget %v)", attempt+1, s.watchdogMaxRestarts, budget)
 			for {
 				if s.onion.Ready() {
+					log.Printf("publish watchdog: onion service published and ready after %v (attempt %d)", time.Since(publishStart).Round(time.Millisecond), attempt+1)
 					return // descriptor published — we're good
 				}
-				elapsed := time.Since(publishStart)
-				if elapsed >= publishTimeout {
-					break // stuck — try restarting
+				if time.Since(publishStart) < budget {
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(s.watchdogPollInterval):
+					}
+					continue
 				}
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(pollInterval):
+				// Timed out waiting for Ready() — but Ready() is one-directional.
+				// It maps to Arti's is_fully_reachable(), true only for Running and
+				// DegradedReachable; Arti's own docs say the service may still be
+				// reachable when it returns false (Recovering, for one, keeps
+				// serving on already-published intro points). Meanwhile a restart
+				// is destructive: it tears down the service and drops the intro
+				// points and descriptor-signing keys, forcing a cold re-publish —
+				// so restarting a service that is actually serving makes us
+				// unreachable rather than fixing anything. If peers have been
+				// reaching us during this window, publication is demonstrably not
+				// stuck: keep waiting instead of restarting.
+				//
+				// The veto window is the base timeout, not this attempt's
+				// budget, so it doesn't stretch to ten minutes on a late
+				// attempt: the question it asks is whether the service is
+				// serving *now*, and a hit that stale is no longer evidence of
+				// that. It did widen with the base timeout, from 90s to four
+				// minutes, which costs nothing either way — a peer in a live
+				// conversation reaches us far more often than that (the phone
+				// log shows /p2p/profile every ~32s), and on the cold start
+				// the longer budget exists for, nothing has ever reached us, so
+				// the veto is inert whatever its window.
+				if s.peerHitWithin(s.watchdogPublishTimeout) {
+					peerSuppressed++
+					if peerSuppressed == 1 || peerSuppressed%10 == 0 {
+						log.Printf("publish watchdog: not ready after %v, but peers are still reaching us — leaving the service alone (%d checks)", budget, peerSuppressed)
+					}
+					publishStart = time.Now()
+					continue
 				}
+				// No peer traffic — which on a cold start proves nothing, since
+				// nothing has ever reached us. Before concluding the publish is
+				// stuck, ask the service itself. Arti distinguishes "retrying
+				// the descriptor upload" and "bootstrapping" from "broken", and
+				// a restart is the remedy only for the latter: it drops the
+				// intro points and descriptor-signing keys, so restarting
+				// mid-publish discards every in-flight HSDir upload and starts
+				// the whole multi-minute publish over. One observed restart
+				// threw away 14 in-flight upload attempts and cost 6m35s on a
+				// publish that was progressing and landed by itself.
+				//
+				// The ceiling keeps this honest: a service that reports
+				// progress indefinitely without publishing is stuck whatever it
+				// says, and gets restarted anyway.
+				if st, known := s.serviceState(); known && !st.NeedsRestart() {
+					if waited := time.Since(attemptStart); waited > s.watchdogMaxPublishWait {
+						log.Printf("publish watchdog: service reports %s but still hasn't published after %v — restarting anyway", st, waited.Round(time.Second))
+						break
+					}
+					stateSuppressed++
+					if stateSuppressed == 1 || stateSuppressed%10 == 0 {
+						log.Printf("publish watchdog: not ready after %v, but the service reports %s — publication is in progress, leaving it alone (%d checks)", budget, st, stateSuppressed)
+					}
+					publishStart = time.Now()
+					continue
+				}
+				break // genuinely stuck: nothing published, nothing arriving
 			}
-			log.Printf("publish watchdog: onion service stuck (not ready after %v), restart attempt %d/%d", publishTimeout, attempt+1, maxRetries)
+			if attempt == s.watchdogMaxRestarts {
+				break
+			}
+			reason := "no peer traffic"
+			if st, known := s.serviceState(); known {
+				reason = fmt.Sprintf("no peer traffic, service reports %s", st)
+			}
+			log.Printf("publish watchdog: onion service stuck (not ready after %v, %s), restart attempt %d/%d", budget, reason, attempt+1, s.watchdogMaxRestarts)
 			// Restart: stop service only (keep the bootstrapped client).
 			type stopServicer interface{ StopService() error }
 			type aliver interface{ IsAlive() bool }
@@ -591,24 +969,28 @@ func (s *Server) startPublishWatchdog() {
 			if addr == "" {
 				return
 			}
-			// Re-derive the onion key from the live session and re-start.
+			// Only restart while a session is still live. Checked, rather than
+			// assumed, because cancellation is cooperative: a lock can land
+			// while we are mid-attempt, and republishing the account onion
+			// after the vault has closed — a duress wipe included — is the one
+			// thing this goroutine must never do. The identity itself is not
+			// touched; the key was derived at unlock.
 			s.sessMu.Lock()
-			id := s.sessID
+			live := s.sessID != nil
 			s.sessMu.Unlock()
-			if id == nil {
+			if !live {
 				return
 			}
-			onionKey, err := onionKeyFor(id)
-			if err != nil {
-				log.Printf("publish watchdog: re-derive key: %v", err)
-				return
-			}
+			// The restart above dropped the intro points and descriptor-signing
+			// keys, so this is a cold re-publish: nothing that reached the old
+			// service tells us anything about the new one.
+			s.forgetReachEvidence()
 			if _, err := s.onion.Start(context.Background(), onionKey, s.publicAddr()); err != nil {
 				log.Printf("publish watchdog: restart failed: %v", err)
 				return
 			}
 		}
-		log.Printf("publish watchdog: service still not ready after %d restart attempts", maxRetries)
+		log.Printf("publish watchdog: service still not ready after %d restart attempts", s.watchdogMaxRestarts)
 	}()
 }
 
@@ -741,6 +1123,9 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /api/update-check", s.auth(s.handleUpdateCheck))
 	mux.HandleFunc("/api/tor-log", s.auth(s.handleTorLog))
 	mux.HandleFunc("GET /api/qr", s.auth(s.handleQR))
+	mux.HandleFunc("GET /api/invite-code", s.auth(s.handleInviteCodeStatus))
+	mux.HandleFunc("POST /api/invite-code", s.originGuard(s.auth(s.handleInviteCode)))
+	mux.HandleFunc("POST /api/rotate", s.originGuard(s.auth(s.handleRotate)))
 	mux.HandleFunc("/api/lock", s.originGuard(s.auth(s.handleLock)))
 	// Desktop shell settings (start-at-login, one-time notices). Reports
 	// "available: false" when no shell is registered.
@@ -756,6 +1141,9 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /api/contacts", s.originGuard(s.auth(s.handleAddContact)))
 	mux.HandleFunc("POST /api/contacts/delete", s.originGuard(s.auth(s.handleDeleteContact)))
 	mux.HandleFunc("POST /api/contacts/block", s.originGuard(s.auth(s.handleBlockContact)))
+	mux.HandleFunc("POST /api/contacts/settings", s.originGuard(s.auth(s.handleContactSettings)))
+	mux.HandleFunc("POST /api/messages/clear", s.originGuard(s.auth(s.handleClearChat)))
+	mux.HandleFunc("POST /api/groups/common", s.originGuard(s.auth(s.handleCommonGroups)))
 	mux.HandleFunc("GET /api/messages", s.auth(s.handleListMessages))
 	mux.HandleFunc("POST /api/messages", s.originGuard(s.auth(s.handleSendMessage)))
 	mux.HandleFunc("POST /api/messages/image", s.originGuard(s.auth(s.handleSendImage)))
@@ -807,12 +1195,19 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /api/friend-requests/accept", s.originGuard(s.auth(s.handleAcceptRequest)))
 	mux.HandleFunc("POST /api/friend-requests/decline", s.originGuard(s.auth(s.handleDeclineRequest)))
 
+	// Feasibility-gate probe for the rotating-identity epic (Phase A). Compiled
+	// in only under the `molepiperotationprobe` build tag; a no-op otherwise.
+	s.registerRotationProbe(mux)
+
 	// Host allowlist wraps everything (anti-DNS-rebinding); the control-token
 	// guard sits just inside it so /api is gated against a same-device app that
-	// forges Host/Origin; request logging is outermost so every request —
-	// including onion-routed ones — is logged. recoverPanic is outermost of all
-	// so it catches panics in any middleware or handler without crashing.
-	return recoverPanic(logRequests(s.hostGuard(s.controlGuard(securityHeaders(mux)))))
+	// forges Host/Origin; request logging is outermost so every request is
+	// logged. logLocalRequests rather than logRequests: this chain only ever
+	// serves the loopback UI, whose 2.5s refresh cycle is pure noise in a log
+	// read to find out what a peer did or didn't deliver. recoverPanic is
+	// outermost of all so it catches panics in any middleware or handler
+	// without crashing.
+	return recoverPanic(logLocalRequests(s.hostGuard(s.controlGuard(securityHeaders(mux)))))
 }
 
 // csp is a strict Content-Security-Policy that ENFORCES the app's no-external-
@@ -881,14 +1276,228 @@ func limitInFlight(n int, next http.Handler) http.Handler {
 	})
 }
 
+// notePeerTraffic stamps the arrival time of every request on the onion-facing
+// listener. Anything reaching this listener came in over a Tor stream that Arti
+// accepted for our onion service, which means a client found our descriptor and
+// completed a rendezvous with us — the one unambiguous signal that we are
+// published and reachable. It wraps only the public listener (the loopback
+// control server carries the UI's own traffic, which proves nothing), and sits
+// outside limitInFlight so even a request we answer with 503 still counts: the
+// peer got to us either way.
+func (s *Server) notePeerTraffic(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.lastPeerHit.Store(time.Now().UnixNano())
+		if !s.reachProven.Swap(true) {
+			log.Printf("reachability: inbound peer traffic on %s %s latched reachProven=true", r.Method, r.URL.Path)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// peerHitWithin reports whether a peer reached us on the onion listener in the
+// last d.
+func (s *Server) peerHitWithin(d time.Duration) bool {
+	ns := s.lastPeerHit.Load()
+	return ns != 0 && time.Since(time.Unix(0, ns)) < d
+}
+
+// forgetReachEvidence drops everything we know about being reachable. Called
+// wherever the onion service is torn down or re-published: what proved the OLD
+// descriptor was serving says nothing about the new one, and leaving it in
+// place would make reachable() claim we are published during the very window
+// where we are not.
+func (s *Server) forgetReachEvidence() {
+	s.lastPeerHit.Store(0)
+	s.reachProven.Store(false)
+	s.publishConfirmed.Store(false)
+}
+
+// publishedOnce reports whether Arti has confirmed publication of the current
+// onion service at least once, latching that fact for as long as the service
+// stands.
+//
+// It exists because Ready() oscillates. Measured on the phone on 2026-10-20:
+// 24 DegradedReachable <-> Bootstrapping transitions in 12 minutes, each one an
+// intro-point re-establishment on a descriptor that was already on the HSDirs.
+// Ready() is false in Bootstrapping (torhost: State::Running |
+// State::DegradedReachable => 1), so anything reading it live treats each of
+// those dips as "not published yet" — which is how announcing() came back to
+// life eight times after the service had been up for three minutes, and how it
+// cancelled most of the probe backoff that is gated on it.
+//
+// Deliberately NOT reachable(): that latches on peer traffic too, and a peer
+// arriving through a cached descriptor's still-live intro points does not prove
+// the descriptor is on the HSDirs for a contact looking us up fresh. One peer's
+// rendezvous must not silence announcements to everybody else. Arti's own
+// Ready() is the stronger claim, so the latch is built on that alone.
+//
+// The write-in-a-predicate matches reachable()/reachProven: the latch only
+// advances when something calls this, which the per-sweep announcing() does.
+// Nothing should read publishConfirmed directly without the Ready() check in
+// front of it.
+func (s *Server) publishedOnce() bool {
+	if s.onion != nil && s.onion.Ready() {
+		s.publishConfirmed.Store(true)
+		return true
+	}
+	return s.publishConfirmed.Load()
+}
+
+// reachable reports whether peers can actually get to us, which is not the same
+// question as whether Arti thinks it has finished publishing.
+//
+// Arti's Ready() stays false until its whole batch of HSDir uploads resolves,
+// and one HSDir that never answers holds that up for OVERALL_UPLOAD_TIMEOUT —
+// five minutes — even when the other uploads landed in seconds. Measured on
+// 2026-10-17: a peer was fetching /p2p/profile over the onion 43s after the
+// publish began and every ~40s after that, while Ready() said false for 5m20s.
+// Showing that as "nobody can reach you" is simply wrong, and it is the whole
+// reason the status took minutes to go green.
+//
+// So an actual peer arriving is taken as the stronger evidence it is: a request
+// on that listener means someone found our descriptor and completed a
+// rendezvous. It can only be a false NEGATIVE (nobody happens to be dialing),
+// never a false positive — which is why it is OR'd in rather than replacing
+// Ready(). Note it cannot help a first-ever publish, where no peer knows the
+// address yet; that case still waits for Arti.
+//
+// The evidence is LATCHED, not windowed. Publication is a fact, not a
+// measure of recent activity: once someone has completed a rendezvous with us
+// the descriptor is up, and it does not stop being up because that contact
+// closed their app. On a window, a user whose only contact goes offline would
+// watch the pill fall back to "publishing your address" with nothing having
+// changed about the service — the same jarring status this exists to fix,
+// arriving from the other direction. That window is reached easily in
+// practice: measured 2026-10-17, Arti was still un-Ready more than three
+// minutes past the flip on both devices, far longer than any contact is
+// guaranteed to keep sweeping.
+//
+// The latch is dropped only where the evidence genuinely dies: by
+// forgetReachEvidence() at every teardown and re-publish, and here when Arti
+// reports a state meaning nothing is published any more.
+func (s *Server) reachable() bool {
+	if s.onion == nil {
+		return false
+	}
+	if s.onion.Ready() {
+		// Arti saying it is published is at least as good evidence as a
+		// rendezvous, and it has to persist on the same terms. Otherwise a
+		// service that went Ready while nobody happened to be dialling drops
+		// straight back to red the moment an intro point fails and Arti goes
+		// to Recovering — which it does routinely; the device log is full of
+		// "Bootstrapping — intro point failure". Latching here means the pill
+		// stays green across a re-establishment, as it should.
+		s.reachProven.Store(true)
+		return true
+	}
+	// Broken or Shutdown: there is no service now, so a past rendezvous says
+	// nothing about the present. NeedsRestart() is the watchdog's own test for
+	// "this is not work in progress" — bootstrapping, recovering and both
+	// degraded states still have a descriptor out there being served.
+	if st, known := s.serviceState(); known && st.NeedsRestart() {
+		return false
+	}
+	return s.reachProven.Load()
+}
+
 // logRequests logs method, path, status and duration for each request. This is
 // what surfaces an onion request hitting the server (the Phase 3 milestone).
+// Used verbatim on the onion-facing listener, where every line is signal: peer
+// traffic is what diagnoses a delivery problem, and a bare GET / returning 200
+// is the reachability probe that proves our descriptor is being served.
 func logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rec, r)
 		log.Printf("%s %s -> %d (%s)", r.Method, r.URL.Path, rec.status, time.Since(start).Round(time.Millisecond))
+	})
+}
+
+// routineLocalGets are the loopback endpoints the web UI re-fetches on its own
+// timer. A prompt, successful
+// GET to one of these tells a reader of the log nothing: the UI polls eight of
+// them every 2.5s, which is ~8 lines a tick and swamped everything else — one
+// phone log ran to 69k lines with three quarters of it this. Only exact paths
+// appear here, all served by the LOCAL mux; nothing onion-facing is listed, so
+// the filter can never hide peer traffic.
+var routineLocalGets = map[string]bool{
+	// The 2.5s refresh cycle (see refreshAll in public/app.js).
+	"/api/identity": true, "/api/contacts": true, "/api/messages": true,
+	"/api/friend-requests": true, "/api/groups": true, "/api/groups/invites": true,
+	"/api/profile": true, "/api/desktop": true,
+	// Polled while a settings or profile pane is open.
+	"/api/invite-code": true, "/api/tor-log": true, "/api/status": true,
+	"/api/version": true,
+	// The WebView shell is deliberately NOT listed. Those requests happen once
+	// per launch — ~90 lines in a 69k-line log, so suppressing them saves
+	// nothing — and GET / is the only mark in the log of the app restarting,
+	// which is the first thing you need when working out whether something
+	// arrived before or after a relaunch.
+}
+
+// slowLocalRequest is the point at which a routine local request stops being
+// routine: a poll that took this long is worth a line, because a stalling
+// handler is exactly the sort of thing the log is read to find.
+const slowLocalRequest = 250 * time.Millisecond
+
+// routineLocal reports whether a request is the UI talking to itself and can be
+// left out of the log. Anything that failed, mutated state, or dragged is kept.
+func routineLocal(r *http.Request, status int, d time.Duration) bool {
+	if r.Method != http.MethodGet || status < 200 || status >= 300 {
+		return false
+	}
+	if d >= slowLocalRequest {
+		return false
+	}
+	return routineLocalGets[r.URL.Path]
+}
+
+// quietCount and quietSince roll the suppressed requests up into one line every
+// quietRollup, so the log still shows the app was alive and polling during a
+// window where nothing else happened. Package-level because logRequests is; the
+// numbers are advisory, so a racing flush losing a count or two does not matter.
+var (
+	quietCount atomic.Int64
+	quietSince atomic.Int64 // Unix-nano window start; 0 before the first one
+)
+
+const quietRollup = 5 * time.Minute
+
+// noteRoutineLocal counts one suppressed request and emits the rollup line when
+// the window is up. No elapsed time in the line: if the app backgrounds
+// mid-window, the window spans hours of sleep that the count says nothing
+// about. The log's own timestamps carry the timing.
+func noteRoutineLocal() {
+	quietCount.Add(1)
+	now := time.Now().UnixNano()
+	start := quietSince.Load()
+	if start == 0 {
+		quietSince.CompareAndSwap(0, now)
+		return
+	}
+	if now-start < int64(quietRollup) {
+		return
+	}
+	if !quietSince.CompareAndSwap(start, now) {
+		return // another goroutine is flushing this window
+	}
+	log.Printf("(%d routine local-UI requests not logged individually)", quietCount.Swap(0))
+}
+
+// logLocalRequests is logRequests for the loopback listener, with the UI's own
+// polling filtered out. Peer traffic never reaches this middleware.
+func logLocalRequests(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+		d := time.Since(start)
+		if routineLocal(r, rec.status, d) {
+			noteRoutineLocal()
+			return
+		}
+		log.Printf("%s %s -> %d (%s)", r.Method, r.URL.Path, rec.status, d.Round(time.Millisecond))
 	})
 }
 
@@ -1317,7 +1926,7 @@ func (s *Server) finishFailedUnlock(w http.ResponseWriter) {
 
 func (s *Server) handleIdentity(w http.ResponseWriter, r *http.Request, id *identity.Identity) {
 	torEnabled := s.onion != nil
-	torReady := torEnabled && s.onion.Ready()
+	torReady := torEnabled && s.reachable()
 	// tor_sendable: outbound circuits are up, so we can dial peers to SEND even
 	// before our own descriptor is published (tor_ready). Sending completes over
 	// a single outbound stream and never needs our inbound reachability, so the
@@ -1326,9 +1935,18 @@ func (s *Server) handleIdentity(w http.ResponseWriter, r *http.Request, id *iden
 	torSendable := torEnabled && s.onion.Dialable()
 
 	var bootstrapFrac float32
-	var hsState string
+	var hsState, svcState string
 	if torEnabled {
 		bootstrapFrac = s.onion.BootstrapFrac()
+		// What the onion service itself says it is doing, where the backend can
+		// ask (the arti host; the desktop sidecar scrapes a log and cannot).
+		// hsState below is derived from two booleans and so collapses the whole
+		// publish window into one word; this distinguishes a publish that is
+		// still coming up from one that is retrying after a failure, which is
+		// the difference between "wait" and "something is wrong".
+		if st, known := s.serviceState(); known {
+			svcState = st.String()
+		}
 		switch {
 		case !torSendable && bootstrapFrac < 1.0:
 			hsState = "bootstrapping"
@@ -1349,6 +1967,7 @@ func (s *Server) handleIdentity(w http.ResponseWriter, r *http.Request, id *iden
 		"tor_sendable":       torSendable,
 		"tor_bootstrap_frac": bootstrapFrac,
 		"tor_hs_state":       hsState,
+		"tor_service_state":  svcState,
 	})
 }
 

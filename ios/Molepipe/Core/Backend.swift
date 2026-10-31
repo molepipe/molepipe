@@ -1,11 +1,14 @@
 import Foundation
+import Mobile
 
 /// Backend wraps the gomobile-bound Go server (backend/mobile).
 ///
-/// The XCFramework is built by ios/build-xcframework.sh; Go's package `mobile`
-/// binds to Swift class `Mobile`; exported funcs bind with a lowercased first
-/// letter (Start -> start, Stop -> stop, IsRunning -> isRunning); and Go `int`
-/// binds to Swift `Int32`.
+/// The XCFramework is built by ios/build-xcframework.sh as `Mobile.xcframework`,
+/// so the Swift module is `Mobile`. gomobile exposes each exported Go function as
+/// a package-prefixed free function — `Start` -> `MobileStart`, `Stop` ->
+/// `MobileStop`, `SetDormant` -> `MobileSetDormant` — not as methods on a
+/// namespace. A Go `(T, error)` return becomes a Swift throwing function, and Go
+/// `int` maps to Swift `Int`.
 ///
 /// BackendService is the single owner of the lifecycle — it is the only thing
 /// that calls start/stop. The view only observes via statePublisher, so a
@@ -29,7 +32,7 @@ final class Backend: ObservableObject {
     private init() {}
 
     /// Bring the backend up. Idempotent: a call while starting or already
-    /// running is a no-op. Mobile.start binds a loopback listener and returns
+    /// running is a no-op. MobileStart binds a loopback listener and returns
     /// its URL quickly (no Argon2 / no Tor at this point), but it does file I/O,
     /// so it runs off the main thread.
     func start(dataDir: String) {
@@ -39,7 +42,14 @@ final class Backend: ObservableObject {
             self.starting = true
             DispatchQueue.main.async { self.state = .starting }
             do {
-                let url = Mobile.start(dataDir)
+                // Hand the backend our zone before it opens its log: Go's
+                // runtime reports UTC for time.Local on mobile regardless of
+                // the device setting, so the run log would otherwise be stamped
+                // hours from the clock on screen. The offset is a fallback for
+                // when the zone itself can't be loaded.
+                let tz = TimeZone.current
+                MobileSetTimeZone(tz.identifier, tz.secondsFromGMT())
+                let url = try MobileStart(dataDir)
                 DispatchQueue.main.async {
                     self.state = .running(url: url)
                     self.starting = false
@@ -57,7 +67,7 @@ final class Backend: ObservableObject {
     /// deliberately blocking: shutdown must finish before the process tears down.
     func stop() {
         do {
-            try Mobile.stop(5000)
+            try MobileStop(5000)
         } catch {
             // Best-effort: the process is on its way out regardless.
         }
@@ -68,6 +78,6 @@ final class Backend: ObservableObject {
     /// tasks (preemptive circuit building, directory fetches) are suspended to
     /// conserve CPU and battery. Existing Tor connections stay alive.
     func setDormant(_ dormant: Bool) {
-        Mobile.setDormant(dormant)
+        MobileSetDormant(dormant)
     }
 }

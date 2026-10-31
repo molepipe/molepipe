@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"time"
 
 	"github.com/molepipe/molepipe/backend/internal/crypto"
@@ -79,14 +81,43 @@ func fetchChallenge(ctx context.Context, client *http.Client, base, recipient st
 
 // FetchProfile dials an account's onion and returns its signed profile. Verifies
 // the profile is signed by that account's key (confirms reachable + authentic).
+//
+// Anonymous: the request identifies nobody. This is the form a stranger uses to
+// look an account up before adding it, so it must stay that way — only callers
+// who already are a contact announce themselves, via FetchProfileAs.
 func FetchProfile(ctx context.Context, dialer tor.Dialer, account string) (Profile, error) {
+	return fetchProfile(ctx, dialer, account, "")
+}
+
+// FetchProfileAs is FetchProfile plus a signed presence hello: it stamps the
+// request with the account the recipient knows us by, a timestamp, and a
+// signature over both bound to the recipient, so the peer can mark us online
+// without waiting to dial us back.
+//
+// That wait is the point. An outbound dial needs only Dialable, never our own
+// published descriptor, and Dialable goes true well before Ready — so this tells
+// a contact we are here minutes before their own probe of us could succeed. It
+// rides the GET the presence sweep already makes, so the announcement is free.
+func FetchProfileAs(ctx context.Context, dialer tor.Dialer, from string, signPriv ed25519.PrivateKey, account string) (Profile, error) {
+	ts := time.Now().Unix()
+	q := url.Values{}
+	q.Set("from", from)
+	q.Set("ts", strconv.FormatInt(ts, 10))
+	q.Set("sig", base64.RawURLEncoding.EncodeToString(ed25519.Sign(signPriv, HelloSigningBlob(ts, account))))
+	return fetchProfile(ctx, dialer, account, "?"+q.Encode())
+}
+
+// fetchProfile is the shared core: `query` is the hello stamp ("" for the
+// anonymous form). The stamp is advisory — a peer that ignores it still serves
+// the same card, and the verification below is unaffected by it either way.
+func fetchProfile(ctx context.Context, dialer tor.Dialer, account, query string) (Profile, error) {
 	ed, err := identity.AccountNumberFromString(account)
 	if err != nil {
 		return Profile{}, fmt.Errorf("bad account: %w", err)
 	}
 	client, base := onionClient(dialer, account)
 	var pr Profile
-	if err := getJSON(ctx, client, base+ProfilePath, &pr); err != nil {
+	if err := getJSON(ctx, client, base+ProfilePath+query, &pr); err != nil {
 		return Profile{}, err
 	}
 	if pr.Account != account {
@@ -131,15 +162,15 @@ func verifyProfileSigUnder(candidates []uint16, ed ed25519.PublicKey, account st
 // so the recipient can confirm WE are asking, then gate on our being an accepted
 // contact. A non-contact (or a stranger) gets an empty mailbox, not an error, so
 // the response is a uniform non-oracle.
-func FetchContactProfile(ctx context.Context, dialer tor.Dialer, id *identity.Identity, recipient string) (ContactProfile, error) {
+func FetchContactProfile(ctx context.Context, dialer tor.Dialer, from string, signPriv ed25519.PrivateKey, recipient string) (ContactProfile, error) {
 	client, base := onionClient(dialer, recipient)
 	ch, err := fetchChallenge(ctx, client, base, recipient)
 	if err != nil {
 		return ContactProfile{}, err
 	}
-	sig := ed25519.Sign(id.Keys.Signing.Private,
+	sig := ed25519.Sign(signPriv,
 		signBlob(sigContextFor(protoVerCurrent), []byte("contact-profile"), ch.Nonce, []byte(recipient)))
-	req := ContactProfileRequest{From: id.AccountNumber(), Nonce: ch.Nonce, Sig: sig}
+	req := ContactProfileRequest{From: from, Nonce: ch.Nonce, Sig: sig}
 	var out ContactProfile
 	if err := postJSONInto(ctx, client, base+ContactProfilePath, req, &out); err != nil {
 		return ContactProfile{}, fmt.Errorf("contact profile: %w", err)
@@ -191,17 +222,19 @@ func FetchAvatar(ctx context.Context, dialer tor.Dialer, account, hash string) (
 	return data, nil
 }
 
-// SendFriendRequest sends a signed friend request bound to reqID.
-func SendFriendRequest(ctx context.Context, dialer tor.Dialer, id *identity.Identity, myName, reqID, recipient string) error {
+// SendFriendRequest sends a signed friend request bound to reqID. inviteToken is
+// the one-time invite code's secret when the recipient was added via a single-use
+// code, else ""; it rides as an unsigned body field (see FriendRequest.InviteToken).
+func SendFriendRequest(ctx context.Context, dialer tor.Dialer, from string, signPriv ed25519.PrivateKey, myName, reqID, recipient, inviteToken string) error {
 	client, base := onionClient(dialer, recipient)
 	ch, err := fetchChallenge(ctx, client, base, recipient)
 	if err != nil {
 		return err
 	}
 	name := clampName(myName)
-	sig := ed25519.Sign(id.Keys.Signing.Private,
+	sig := ed25519.Sign(signPriv,
 		signBlob(sigContextFor(protoVerCurrent), []byte("friend-request"), ch.Nonce, []byte(recipient), []byte(name), []byte(reqID)))
-	req := FriendRequest{From: id.AccountNumber(), FromName: name, ReqID: reqID, Nonce: ch.Nonce, Sig: sig}
+	req := FriendRequest{From: from, FromName: name, ReqID: reqID, Nonce: ch.Nonce, Sig: sig, InviteToken: inviteToken}
 	if err := postJSON(ctx, client, base+FriendRequestPath, req); err != nil {
 		return fmt.Errorf("friend request: %w", err)
 	}
@@ -209,16 +242,16 @@ func SendFriendRequest(ctx context.Context, dialer tor.Dialer, id *identity.Iden
 }
 
 // SendFriendAccept sends a signed accept echoing reqID.
-func SendFriendAccept(ctx context.Context, dialer tor.Dialer, id *identity.Identity, myName, reqID, recipient string) error {
+func SendFriendAccept(ctx context.Context, dialer tor.Dialer, from string, signPriv ed25519.PrivateKey, myName, reqID, recipient string) error {
 	client, base := onionClient(dialer, recipient)
 	ch, err := fetchChallenge(ctx, client, base, recipient)
 	if err != nil {
 		return err
 	}
 	name := clampName(myName)
-	sig := ed25519.Sign(id.Keys.Signing.Private,
+	sig := ed25519.Sign(signPriv,
 		signBlob(sigContextFor(protoVerCurrent), []byte("friend-accept"), ch.Nonce, []byte(recipient), []byte(name), []byte(reqID)))
-	acc := FriendAccept{From: id.AccountNumber(), FromName: name, ReqID: reqID, Nonce: ch.Nonce, Sig: sig}
+	acc := FriendAccept{From: from, FromName: name, ReqID: reqID, Nonce: ch.Nonce, Sig: sig}
 	if err := postJSON(ctx, client, base+FriendAcceptPath, acc); err != nil {
 		return fmt.Errorf("friend accept: %w", err)
 	}
@@ -258,6 +291,58 @@ func SendMessage(ctx context.Context, dialer tor.Dialer, id *identity.Identity, 
 	env := Envelope{Sender: id.AccountNumber(), SenderDHPub: myDH[:], Nonce: ch.Nonce, Sig: sig, Box: box}
 	if err := postJSON(ctx, client, base+MessagePath, env); err != nil {
 		return fmt.Errorf("send: %w", err)
+	}
+	return nil
+}
+
+// FetchPrekeyBundle does the challenge handshake, signs a bundle request so the
+// recipient can gate it to accepted contacts, and returns the verified bundle
+// for X3DH. The recipient consumes a one-time prekey on success, so this is
+// called at most once per session establishment. The signed-prekey signature is
+// verified against the recipient's Ed identity here; the caller still supplies
+// the recipient's X25519 identity key (ch.DHPub) separately for X3DH.
+func FetchPrekeyBundle(ctx context.Context, dialer tor.Dialer, from string, signPriv ed25519.PrivateKey, recipient string) (crypto.PrekeyBundle, Challenge, error) {
+	recipientEd, err := identity.AccountNumberFromString(recipient)
+	if err != nil {
+		return crypto.PrekeyBundle{}, Challenge{}, fmt.Errorf("bad recipient: %w", err)
+	}
+	client, base := onionClient(dialer, recipient)
+	ch, err := fetchChallenge(ctx, client, base, recipient)
+	if err != nil {
+		return crypto.PrekeyBundle{}, Challenge{}, err
+	}
+	sig := ed25519.Sign(signPriv, PrekeyBundleSigningBlob(ch.Nonce, recipient))
+	req := PrekeyBundleRequest{From: from, Nonce: ch.Nonce, Sig: sig}
+	var bundle crypto.PrekeyBundle
+	if err := postJSONInto(ctx, client, base+PrekeyBundlePath, req, &bundle); err != nil {
+		return crypto.PrekeyBundle{}, Challenge{}, fmt.Errorf("prekey bundle: %w", err)
+	}
+	if err := crypto.VerifyBundle(bundle, recipientEd); err != nil {
+		return crypto.PrekeyBundle{}, Challenge{}, fmt.Errorf("prekey bundle invalid: %w", ErrProtocol)
+	}
+	return bundle, ch, nil
+}
+
+// SendRatchetInit posts a prepared InitialRatchetEnvelope (the X3DH handshake
+// plus the first ciphertext) to the recipient's RatchetInitPath. It is a dumb
+// transport: the caller has already encrypted, signed, and persisted the
+// session state, so a failed post can be retried without reusing a ratchet key.
+func SendRatchetInit(ctx context.Context, dialer tor.Dialer, recipient string, env InitialRatchetEnvelope) error {
+	client, base := onionClient(dialer, recipient)
+	if err := postJSON(ctx, client, base+RatchetInitPath, env); err != nil {
+		return fmt.Errorf("send ratchet-init: %w", err)
+	}
+	return nil
+}
+
+// SendRatchetMessage posts a prepared RatchetEnvelope to an established
+// session's RatchetMessagePath. Like SendRatchetInit it is a dumb transport:
+// no challenge handshake (an established v2 message needs no nonce — the ratchet
+// counters give replay/ordering), and the caller owns encryption/persistence.
+func SendRatchetMessage(ctx context.Context, dialer tor.Dialer, recipient string, env RatchetEnvelope) error {
+	client, base := onionClient(dialer, recipient)
+	if err := postJSON(ctx, client, base+RatchetMessagePath, env); err != nil {
+		return fmt.Errorf("send ratchet-message: %w", err)
 	}
 	return nil
 }

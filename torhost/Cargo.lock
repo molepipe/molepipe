@@ -4939,7 +4939,12 @@ dependencies = [
  "tor-hsservice",
  "tor-keymgr",
  "tor-llcrypto",
+ "tor-netdir",
+ "tor-netdoc",
  "tor-rtcompat",
+ "tracing",
+ "tracing-core",
+ "tracing-subscriber",
 ]
 
 [[package]]

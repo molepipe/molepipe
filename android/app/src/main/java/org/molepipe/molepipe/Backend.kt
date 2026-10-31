@@ -3,6 +3,7 @@ package org.molepipe.molepipe
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import java.util.TimeZone
 import mobile.Mobile
 
 /**
@@ -69,6 +70,14 @@ object Backend {
         val dataDir = context.filesDir.absolutePath
         Thread({
             try {
+                // Hand the backend our zone before it opens the log. Go's
+                // runtime reports UTC for time.Local on Android no matter what
+                // the device is set to, so without this the run log is stamped
+                // hours away from the clock on screen. The offset is a fallback
+                // for devices whose tzdata the Go runtime can't find; Go int
+                // binds to Java long, hence toLong().
+                val tz = TimeZone.getDefault()
+                Mobile.setTimeZone(tz.id, (tz.getOffset(System.currentTimeMillis()) / 1000).toLong())
                 // Passing filesDir is what keeps the backend off the desktop
                 // config-dir default it would otherwise reject.
                 val url = Mobile.start(dataDir)

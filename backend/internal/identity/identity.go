@@ -123,6 +123,31 @@ func (id *Identity) OnionAddress() string {
 	return id.AccountNumber() + ".onion"
 }
 
+// AliasSigningKey derives the Ed25519 keypair for rotation alias `index`
+// (m/0'/2'/index'), recomputing the seed from the mnemonic. The returned
+// Private is sensitive — zero it after use. The durable identity (AccountNumber,
+// DH key) is unaffected by rotation; only the externally-published onion address
+// rotates across aliases.
+func (id *Identity) AliasSigningKey(index uint32) (crypto.SigningKeyPair, error) {
+	seed, err := crypto.SeedFromMnemonic(string(id.Mnemonic), string(id.Passphrase))
+	if err != nil {
+		return crypto.SigningKeyPair{}, err
+	}
+	defer crypto.Zero(seed)
+	return crypto.DeriveAliasSigningKey(seed, index)
+}
+
+// AliasAccount returns the account number (== onion label) for rotation alias
+// `index`, without exposing private key material.
+func (id *Identity) AliasAccount(index uint32) (string, error) {
+	kp, err := id.AliasSigningKey(index)
+	if err != nil {
+		return "", err
+	}
+	defer crypto.Zero(kp.Private)
+	return accountNumber(kp.Public), nil
+}
+
 // AccountNumberForPub encodes a raw Ed25519 public key as an account number.
 // Exposed so the Tor sidecar can render the .onion for a key without
 // duplicating the v3 encoding.

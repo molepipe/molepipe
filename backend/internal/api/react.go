@@ -33,6 +33,11 @@ func (s *Server) hookOnReaction(from, messageID, emoji string, remove bool) erro
 	s.sessMu.Lock()
 	defer s.sessMu.Unlock()
 
+	// Reached only after the protocol layer verified the signature and consumed
+	// the nonce, so this is authenticated direct traffic: promote presence before
+	// looking at the target, which we may legitimately no longer hold.
+	s.touchPeerPresenceLocked(from, "direct reaction")
+
 	for i := range s.messages {
 		m := &s.messages[i]
 		if m.ID != messageID {

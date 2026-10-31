@@ -20,7 +20,6 @@ const (
 	groupMaxBodyByte = 1 << 17 // 128 KiB
 	groupOpTimeout   = 60 * time.Second
 
-	groupSyncStartDelay  = 20 * time.Second // let the onion publish before first pull
 	groupSyncInterval    = 45 * time.Second
 	groupSyncMaxBodyByte = 1 << 19 // 512 KiB — a have-list of ids
 	groupSyncMaxMessages = 100     // per pull; the rest come next round
@@ -147,12 +146,12 @@ func (s *Server) deliverGroupInboundLocked(gm protocol.GroupMessage, notify bool
 	return true
 }
 
-// groupAuthorNameLocked resolves a display name for a group message's author: a
-// contact name if we have one, else the roster's name for them, else the raw
-// account. Caller holds sessMu.
+// groupAuthorNameLocked resolves a display name for a group message's author: our
+// nickname for them or the contact name if we have one, else the roster's name for
+// them, else the raw account. Caller holds sessMu.
 func (s *Server) groupAuthorNameLocked(groupID, author string) string {
-	if c, ok := s.contacts[author]; ok && c.Name != "" {
-		return c.Name
+	if c, ok := s.contacts[author]; ok && c.DisplayName() != "" {
+		return c.DisplayName()
 	}
 	if g, ok := s.groups[groupID]; ok {
 		for _, m := range g.Members {
@@ -414,17 +413,9 @@ func (s *Server) handleP2PGroupSync(w http.ResponseWriter, r *http.Request) {
 // relays / everyone catches you up" model. Pull-based and symmetric: each member
 // pulls from the others, so the union converges without push-back.
 func (s *Server) groupSyncLoop(ctx context.Context, id *identity.Identity) {
-	t := time.NewTimer(groupSyncStartDelay)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			s.groupSyncTick(ctx, id)
-			t.Reset(groupSyncInterval)
-		}
-	}
+	s.runLoop(ctx, groupSyncInterval, func() {
+		s.groupSyncTick(ctx, id)
+	})
 }
 
 func (s *Server) groupSyncTick(ctx context.Context, id *identity.Identity) {

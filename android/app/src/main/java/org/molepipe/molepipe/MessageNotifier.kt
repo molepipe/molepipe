@@ -59,6 +59,7 @@ object MessageNotifier : MessageListener {
     private const val PER_SENDER_BASE = 1000
     private const val FRIEND_REQUEST_BASE = 2000
     private const val GROUP_INVITE_BASE = 3000
+    private const val FRIEND_ACCEPT_BASE = 4000
     private const val ICON_SIZE = 96 // pixels for the circular avatar / monogram
     private const val MAX_MESSAGES = 5 // recent messages kept per sender in the transcript
 
@@ -185,6 +186,27 @@ object MessageNotifier : MessageListener {
         } catch (_: SecurityException) {}
     }
 
+    /** Someone accepted a friend request we sent — the reply to the user's own ask. */
+    override fun onFriendAccept(fromName: String) {
+        val ctx = appContext ?: return
+        if (AppState.inForeground) return
+        val mgr = NotificationManagerCompat.from(ctx)
+        if (!mgr.areNotificationsEnabled()) return
+        val monogram = monogramBitmap(fromName)
+        val notification = NotificationCompat.Builder(ctx, REQUESTS_CHANNEL_ID)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setLargeIcon(monogram)
+            .setContentTitle(fromName)
+            .setContentText(ctx.getString(R.string.notif_friend_accept_text))
+            .setAutoCancel(true)
+            .setCategory(NotificationCompat.CATEGORY_SOCIAL)
+            .setContentIntent(openApp(ctx))
+            .build()
+        try {
+            mgr.notify(friendAcceptId(fromName), notification)
+        } catch (_: SecurityException) {}
+    }
+
     override fun onGroupInvite(inviterName: String, groupName: String) {
         val ctx = appContext ?: return
         if (AppState.inForeground) return
@@ -281,6 +303,7 @@ object MessageNotifier : MessageListener {
     private fun perSenderId(sender: String) = PER_SENDER_BASE + (sender.hashCode() and 0xffff)
     private fun friendRequestId(name: String) = FRIEND_REQUEST_BASE + (name.hashCode() and 0xffff)
     private fun groupInviteId(group: String) = GROUP_INVITE_BASE + (group.hashCode() and 0xffff)
+    private fun friendAcceptId(name: String) = FRIEND_ACCEPT_BASE + (name.hashCode() and 0xffff)
 
     private fun openApp(ctx: Context) = PendingIntent.getActivity(
         ctx,

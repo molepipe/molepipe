@@ -17,7 +17,6 @@ import (
 const (
 	maxGroupInvites = 200 // cap pending received invites (anti-spam)
 
-	groupInviteRetryStart    = 30 * time.Second
 	groupInviteRetryInterval = 60 * time.Second
 	// groupInviteMaxRefusals bounds retries against a peer that keeps answering
 	// "no matching invite" (the group was abandoned before we joined). A transport
@@ -48,9 +47,12 @@ func (s *Server) hookOnGroupInvite(groupID, groupName, inviter, inviterName, req
 		GroupID: groupID, Name: groupName, Inviter: inviter, ReqID: reqID, At: time.Now(),
 	}
 	s.persistLocked()
-	// Notify the Android shell so it can post a system notification.
+	// Notify the Android shell so it can post a system notification. The label is
+	// resolved through our own contact record first, so a nickname (or a saved name)
+	// beats the display name the inviter put on the wire.
 	if fn := s.onGroupInvite; fn != nil {
-		go fn(inviterName, groupName)
+		who := s.contactDisplayNameLocked(inviter, inviterName)
+		go fn(who, groupName)
 	}
 	return nil
 }
@@ -289,8 +291,8 @@ func (s *Server) handleListGroupInvites(w http.ResponseWriter, r *http.Request, 
 	out := []map[string]any{}
 	for _, inv := range s.groupInvites {
 		inviterName := inv.Inviter
-		if c, ok := s.contacts[inv.Inviter]; ok && c.Name != "" {
-			inviterName = c.Name
+		if c, ok := s.contacts[inv.Inviter]; ok && c.DisplayName() != "" {
+			inviterName = c.DisplayName()
 		}
 		status := "pending"
 		if inv.Accepted {
@@ -313,17 +315,9 @@ func (s *Server) handleListGroupInvites(w http.ResponseWriter, r *http.Request, 
 // POST succeeded" — otherwise an inviter who received the accept but died before
 // committing (or whose roster push was lost) would strand us silently.
 func (s *Server) groupInviteRetryLoop(ctx context.Context, id *identity.Identity) {
-	t := time.NewTimer(groupInviteRetryStart)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			s.groupInviteRetryTick(ctx, id)
-			t.Reset(groupInviteRetryInterval)
-		}
-	}
+	s.runLoop(ctx, groupInviteRetryInterval, func() {
+		s.groupInviteRetryTick(ctx, id)
+	})
 }
 
 func (s *Server) groupInviteRetryTick(ctx context.Context, id *identity.Identity) {

@@ -19,8 +19,7 @@ import (
 // direction they cannot use, so a single best-effort push left them stranded
 // permanently whenever their onion descriptor hadn't propagated yet.
 const (
-	acceptRetryStartDelay = 15 * time.Second
-	acceptRetryInterval   = 60 * time.Second
+	acceptRetryInterval = 60 * time.Second
 	// acceptRetryTTL is how long we keep trying. Generous, because the cost of
 	// giving up early is a contact pair that silently never works.
 	acceptRetryTTL = 7 * 24 * time.Hour
@@ -47,17 +46,9 @@ func (s *Server) queueAcceptLocked(account, reqID string) {
 func (s *Server) dequeueAcceptLocked(account string) { delete(s.pendingAccepts, account) }
 
 func (s *Server) acceptRetryLoop(ctx context.Context, id *identity.Identity) {
-	t := time.NewTimer(acceptRetryStartDelay)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			s.acceptRetryTick(ctx, id)
-			t.Reset(acceptRetryInterval)
-		}
-	}
+	s.runLoop(ctx, acceptRetryInterval, func() {
+		s.acceptRetryTick(ctx, id)
+	})
 }
 
 func (s *Server) acceptRetryTick(ctx context.Context, id *identity.Identity) {
@@ -90,7 +81,17 @@ func (s *Server) acceptRetryTick(ctx context.Context, id *identity.Identity) {
 			return
 		default:
 		}
-		err := protocol.SendFriendAccept(ctx, s.onion.Dialer(), id, name, p.ReqID, p.Account)
+		// Present the account this requester knows us by (their MyAccountKnown), not
+		// the primary. A non-resident alias (swept past grace between request and this
+		// retry) fails loud here: treat it like a network failure — keep the debt
+		// queued and let acceptRetryTTL expire it, never clearPendingAccept (which
+		// would silently discard an accept the requester still cannot repair).
+		fromAcct, signPriv, ierr := s.outboundIdentity(id, p.Account)
+		if ierr != nil {
+			log.Printf("friend-accept to %s: cannot resolve outbound identity, keeping queued: %v", p.Account, ierr)
+			continue
+		}
+		err := protocol.SendFriendAccept(ctx, s.onion.Dialer(), fromAcct, signPriv, name, p.ReqID, p.Account)
 		if err == nil {
 			log.Printf("friend-accept to %s delivered on retry", p.Account)
 			s.clearPendingAccept(p.Account)

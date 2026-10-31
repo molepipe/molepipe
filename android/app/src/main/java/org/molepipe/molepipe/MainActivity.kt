@@ -16,6 +16,7 @@ import android.provider.MediaStore
 import android.provider.Settings
 import android.util.Base64
 import android.app.AlertDialog
+import android.view.ViewGroup
 import android.webkit.JavascriptInterface
 import android.webkit.PermissionRequest
 import android.webkit.ValueCallback
@@ -30,6 +31,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import androidx.core.content.IntentCompat
 import androidx.core.view.ViewCompat
 import java.io.File
 import java.io.FileOutputStream
@@ -59,10 +61,16 @@ class MainActivity : ComponentActivity() {
     private var insetsJs: String? = null
 
     /**
-     * The single, deliberately tiny bridge the loopback UI can call back into.
-     * The WebView only ever loads our own 127.0.0.1 first-party content, and the
-     * one exposed method just flips the system-bar icon contrast, so this adds no
-     * meaningful attack surface (and minSdk 24 is clear of the old pre-17 hole).
+     * The deliberately small bridge the loopback UI can call back into: system-bar
+     * contrast, the system palette, opening an external URL, saving or sharing an
+     * image, and holding the UI's session token across a WebView rebuild.
+     *
+     * The WebView only ever loads our own 127.0.0.1 first-party content, so the
+     * only caller is our own page, and minSdk 24 is clear of the old pre-17 hole.
+     * The session-token accessors are the most sensitive pair here and still add
+     * no surface: script able to call getSessionToken could just as easily read
+     * the page's own sessionToken variable. See [ShellSession] for why holding it
+     * in memory does not outlive the vault it authenticates against.
      */
     private inner class ShellBridge {
         // lightBackground = the app is showing a light theme, so the status/nav
@@ -86,6 +94,17 @@ class MainActivity : ComponentActivity() {
          * the user no way back. Only http/https is honoured, so the bridge can't be
          * steered into arbitrary intents (tel:, intent:, file:, …).
          */
+        // Mirror of the page's in-memory session token, so a WebView rebuilt by an
+        // Activity recreation can resume the session the vault is still holding
+        // open instead of asking for the PIN again. Memory only — see [ShellSession].
+        @JavascriptInterface
+        fun setSessionToken(token: String) {
+            ShellSession.set(token)
+        }
+
+        @JavascriptInterface
+        fun getSessionToken(): String = ShellSession.get()
+
         @JavascriptInterface
         fun openUrl(url: String) {
             val u = url.trim()
@@ -230,6 +249,20 @@ class MainActivity : ComponentActivity() {
                 startActivity(Intent.createChooser(intent, "Share image"))
             } catch (_: Throwable) {}
         }
+
+        /**
+         * Collects an image another app shared into us, as
+         * `{"mime":"image/jpeg","data":"<base64>"}`, or "" when nothing is
+         * waiting. Clears the slot as it reads — see [SharedImage] for why the
+         * bytes wait on this side of the bridge until the page is unlocked, and
+         * why the page must only call this from its unlocked path.
+         */
+        @JavascriptInterface
+        fun takeSharedImage(): String {
+            val share = SharedImage.take() ?: return ""
+            val data = Base64.encodeToString(share.bytes, Base64.NO_WRAP)
+            return "{\"mime\":\"${share.mime}\",\"data\":\"$data\"}"
+        }
     }
 
     // The notification is nice-to-have; a denied permission does not block the
@@ -272,6 +305,89 @@ class MainActivity : ComponentActivity() {
                 cb.onReceiveValue(out)
             }.start()
         }
+
+    // An image shared into us is read in full and capped here rather than kept as
+    // a content:// URI: the grant that came with the intent is scoped to this
+    // task, and the user may sit on the lock screen for a long while before the
+    // picker is allowed to appear. Matches the cap the outbound bridge methods use.
+    private val shareCapBytes = 10 * 1024 * 1024
+
+    /**
+     * Picks up an ACTION_SEND image, decodes it off the main thread, parks it in
+     * [SharedImage] and nudges the page. Deliberately does NOT look at whether
+     * the app is locked: the page decides when to collect (showUnlocked), so the
+     * lock screen stays in front of the contact list either way.
+     */
+    private fun handleShareIntent(intent: Intent?) {
+        if (intent == null || intent.action != Intent.ACTION_SEND) return
+        // EXTRA_STREAM is the convention and what the framework's own
+        // migrateExtraStreamToClipData keys off, but some senders fill only
+        // clipData — without the fallback those shares would land on us and
+        // silently do nothing, which is the worst of the failure modes.
+        val uri = IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
+            ?: intent.clipData?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.uri
+            ?: return
+        // getIntent() survives an Activity recreation (night mode, locale, font
+        // scale), so leaving the image in place would re-open the picker with one
+        // the user has already sent. Consume it from the held intent.
+        intent.removeExtra(Intent.EXTRA_STREAM)
+        intent.clipData = null
+        val declared = intent.type ?: ""
+        Thread {
+            val share = try { readSharedImage(uri, declared) } catch (_: Throwable) { null }
+            if (share == null) {
+                runOnUiThread {
+                    Toast.makeText(this, getString(R.string.share_in_failed), Toast.LENGTH_LONG).show()
+                }
+                return@Thread
+            }
+            SharedImage.put(share)
+            // Only reaches an already-loaded page; a cold start has no document
+            // yet and is covered by the page's own pull in showUnlocked().
+            runOnUiThread {
+                if (::webView.isInitialized) {
+                    webView.evaluateJavascript("window.onSharedImage && window.onSharedImage()", null)
+                }
+            }
+        }.start()
+    }
+
+    /**
+     * Reads [uri] into a capped [PendingShare]. The MIME comes from the content
+     * resolver first and the intent's own type only as a fallback — a share sheet
+     * routinely declares only the generic image wildcard, which is no use for
+     * the data: URL the page builds. HEIC/HEIF goes through the same transcode as the file
+     * picker, since the WebView's Chromium cannot decode it.
+     */
+    private fun readSharedImage(uri: Uri, declaredType: String): PendingShare? {
+        val jpeg = transcodeHeicOne(uri) // null unless this is a HEIC/HEIF
+        val src = jpeg ?: uri
+        val mime = when {
+            jpeg != null -> "image/jpeg"
+            else -> {
+                val resolved = contentResolver.getType(uri)?.lowercase() ?: ""
+                if (resolved.startsWith("image/") && resolved != "image/*") resolved
+                else declaredType.lowercase()
+            }
+        }
+        if (!mime.startsWith("image/") || mime == "image/*") return null
+        val bytes = contentResolver.openInputStream(src)?.use { readCapped(it) } ?: return null
+        return PendingShare(mime, bytes)
+    }
+
+    // Reads at most shareCapBytes, returning null if the stream is longer rather
+    // than handing the page a truncated — and so undecodable — image.
+    private fun readCapped(input: java.io.InputStream): ByteArray? {
+        val out = java.io.ByteArrayOutputStream()
+        val buf = ByteArray(64 * 1024)
+        while (true) {
+            val n = input.read(buf)
+            if (n < 0) break
+            if (out.size() + n > shareCapBytes) return null
+            out.write(buf, 0, n)
+        }
+        return if (out.size() == 0) null else out.toByteArray()
+    }
 
     // transcodeHeicUris replaces any HEIC/HEIF picks with a freshly-written JPEG
     // (via FileProvider) and passes everything else through untouched.
@@ -433,6 +549,11 @@ class MainActivity : ComponentActivity() {
         BackendService.start(this)
         maybeAskBatteryExemption()
 
+        // A cold start from the share sheet: park the image now, long before the
+        // backend is up and the page exists. The page collects it once it is
+        // unlocked (see [SharedImage]).
+        handleShareIntent(intent)
+
         onBackPressedDispatcher.addCallback(this) {
             webView.evaluateJavascript("window.handleAndroidBack ? window.handleAndroidBack() : false") { result ->
                 if (result != "true") {
@@ -482,6 +603,17 @@ class MainActivity : ComponentActivity() {
             .show()
     }
 
+    // A share into a running app arrives here rather than through onCreate
+    // (launchMode singleTop + the ACTION_SEND filter), so the existing WebView —
+    // and the unlocked session behind it — is reused instead of a second one
+    // being built. setIntent keeps getIntent() in step, which handleShareIntent
+    // relies on when it consumes the extra.
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleShareIntent(intent)
+    }
+
     override fun onStart() {
         super.onStart()
         // The window is visible: suppress message notifications and clear any that
@@ -504,6 +636,26 @@ class MainActivity : ComponentActivity() {
         // battery. Existing circuits and TCP connections stay alive.
         Backend.setDormant(true)
         super.onStop()
+    }
+
+    override fun onDestroy() {
+        // A recreated Activity (a configuration change outside our configChanges
+        // list — night mode, locale, font scale — or a normal finish) builds a
+        // brand-new WebView. Dropping the old reference is not enough: its
+        // renderer keeps running the page, which polls the backend every 2.5s,
+        // until GC eventually collects it. BackendService keeps that backend
+        // alive, so those orphan polls are answered — carrying a session token
+        // the next unlock has already rotated away, which the backend correctly
+        // refuses with a 401 — every 401 in the run log is one of these. The
+        // orphan then stops on its own, but until it does it burns CPU, battery
+        // and backend work for a page nobody can see. Tear the page down with
+        // the Activity that owns it; safe, since the backend outlives us.
+        if (::webView.isInitialized) {
+            webView.loadUrl("about:blank") // stops the poll chain immediately
+            (webView.parent as? ViewGroup)?.removeView(webView)
+            webView.destroy()
+        }
+        super.onDestroy()
     }
 
     private fun render(state: Backend.State) {

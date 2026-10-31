@@ -50,5 +50,7 @@
     <string>Molepipe needs camera access to scan QR codes for adding contacts.</string>
     <key>NSPhotoLibraryAddUsageDescription</key>
     <string>Molepipe needs photo library access to save images you choose to download.</string>
+    <key>NSFaceIDUsageDescription</key>
+    <string>Molepipe can use Face ID to unlock your account without re-entering your password.</string>
 </dict>
 </plist>
