@@ -9,7 +9,15 @@ plugins {
 // (keys: storeFile, storePassword, keyAlias, keyPassword), so no signing secret
 // is ever committed. When the file is absent — CI, a fresh clone, a debug-only
 // workflow — `assembleRelease` still builds; it is simply left unsigned.
-val keystorePropsFile = rootProject.file("keystore.properties")
+//
+// "../" because the Gradle root is android/, not the repo: settings.gradle.kts
+// lives beside this module's parent, so rootProject.file("keystore.properties")
+// resolves to android/keystore.properties. That is NOT where the release
+// scripts, the .gitignore entry or any of this documentation put the file, and
+// the only symptom of the mismatch is a release build that quietly comes out
+// unsigned — `./gradlew :app:signingReport` showing "Config: none" with the
+// file sitting right there — so the path is spelled out rather than inferred.
+val keystorePropsFile = rootProject.file("../keystore.properties")
 val keystoreProps = Properties().apply {
     if (keystorePropsFile.exists()) keystorePropsFile.inputStream().use { load(it) }
 }
@@ -34,6 +42,24 @@ android {
         versionName = (project.findProperty("onionVersionName") as String?) ?: "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // The ABIs the backend exists for. build-aar.sh cross-compiles torhost
+        // and gomobile-binds the Go backend for exactly these two, so
+        // libgojni.so only ever exists for arm64-v8a and x86_64.
+        //
+        // This has to be declared, not left implicit, because other
+        // dependencies (androidx.graphics.path) ship all four ABIs. Without the
+        // filter the app bundle gains armeabi-v7a and x86 lib directories
+        // carrying those libraries and NOT libgojni.so — and Play reads a
+        // bundle's lib directories as the list of devices the app supports. It
+        // would then offer the app to 32-bit-only phones, hand them a split
+        // with no backend in it, and the first launch would die in
+        // System.loadLibrary. Restricting it here means Play excludes those
+        // devices from the listing instead, which is the honest answer: there
+        // is no 32-bit build to give them.
+        ndk {
+            abiFilters += listOf("arm64-v8a", "x86_64")
+        }
     }
 
     signingConfigs {

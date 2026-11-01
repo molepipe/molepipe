@@ -3537,7 +3537,8 @@ $("wiz-avatar-input").addEventListener("change", async (e) => {
   if (!file) return;
   const err = $("wiz-avatar-error"); err.hidden = true;
   try {
-    const cropped = await openAvatarCropper(file);
+    const { file: src, note } = await renderableImage(file, 1024);
+    const cropped = await openAvatarCropper(src);
     if (!cropped) return; // cancelled in the crop editor
     wizPendingAvatar = await blobToBase64(cropped);
     // Preview straight off the cropped blob — the old code round-tripped the
@@ -3548,6 +3549,8 @@ $("wiz-avatar-input").addEventListener("change", async (e) => {
     const img = document.createElement("img"); img.src = url; img.alt = "Profile picture";
     img.style.cssText = "width:100%;height:100%;object-fit:cover;border-radius:50%";
     box.append(img);
+    const n = noteWorthTelling(note);
+    if (n) showToast("Picture set — " + n + ".");
   } catch (ex) {
     err.textContent = ex.message || "Couldn't read that image.";
     err.hidden = false;
@@ -3870,13 +3873,19 @@ $("avatar-input").addEventListener("change", async (e) => {
   const err = $("avatar-error"); err.hidden = true;
   const btn = $("avatar-btn"); btn.setAttribute("disabled", "");
   try {
-    const blob = await openAvatarCropper(file);
+    // Converted before the cropper rather than inside it: the cropper draws
+    // with an <img>, which reads even fewer formats than createImageBitmap.
+    // Without this, a RAW could be sent in a chat but not set as a picture.
+    const { file: src, note } = await renderableImage(file, 1024);
+    const blob = await openAvatarCropper(src);
     if (!blob) return; // cancelled — keep whatever picture was already set
     const b64 = await blobToBase64(blob);
     const { ok, body } = await api("/api/profile", { method: "POST", body: JSON.stringify({ avatar: b64 }) });
     if (!ok) { err.textContent = (body && body.error) || "Couldn't set that picture."; err.hidden = false; return; }
     myAvatarHash = body.avatar_hash || "";
     renderMyAvatar();
+    const n = noteWorthTelling(note);
+    if (n) showToast("Picture set — " + n + ".");
   } catch (ex) {
     err.textContent = ex.message || "Couldn't read that image.";
     err.hidden = false;
@@ -4867,6 +4876,10 @@ async function shareViewerImage() {
 // Decode, downscale and re-encode to JPEG under the size cap the backend
 // enforces, so the wire payload is bounded and the type is always allowlisted.
 const IMAGE_CAP_BYTES = 3 * 1024 * 1024;
+// Backend format conversion gets its own, longer budget than an ordinary API
+// call: a 90 MB RAW has to be read off storage and walked before a single byte
+// comes back, and timing that out would look like "this app rejects my photos".
+const IMAGE_DECODE_TIMEOUT_MS = 180000;
 // Cap for a group image's inline thumbnail (matches protocol.MaxGroupThumbBytes).
 const GROUP_THUMB_CAP_BYTES = 16 * 1024;
 
@@ -4887,20 +4900,109 @@ async function encodeScaled(bitmap, maxDim, capBytes, startQ = 0.85) {
   return blob;
 }
 
-// processImage returns { blob, mime } for a 1:1 photo. A GIF is passed through
-// byte-for-byte (the backend allowlists image/gif) — re-encoding to JPEG would
-// flatten an animated GIF to a single static frame. Everything else is decoded,
-// downscaled and re-encoded to JPEG under the cap.
+// tryBitmap decodes a file with the browser, or returns null if the browser
+// can't read it. It does NOT rely on createImageBitmap rejecting: a file with a
+// missing or wrong type can also resolve to a degenerate 0x0 bitmap, which
+// would sail through a bare try/catch and then fail further along as a blank
+// photo. Both outcomes mean the same thing here — ask the backend.
+async function tryBitmap(file) {
+  try {
+    const bm = await createImageBitmap(file);
+    if (bm.width > 0 && bm.height > 0) return bm;
+    if (bm.close) bm.close();
+  } catch (_) { /* unreadable by the browser */ }
+  return null;
+}
+
+// convertViaBackend posts the picked file to the Go decoder and gets back
+// something the browser can definitely read. This is what makes RAW files,
+// PSDs, TIFFs, HDRs and the rest pickable — the browser decodes four or five
+// formats, the backend decodes dozens.
+//
+// Not routed through api(): the body is the raw file rather than JSON (a 90 MB
+// RAW would become ~120 MB of base64, held in memory on both sides), the reply
+// is image bytes rather than JSON, and a large RAW can take longer than the
+// usual API timeout to walk.
+async function convertViaBackend(file, maxDim) {
+  const headers = {};
+  if (controlToken) headers["X-Control-Token"] = controlToken;
+  if (sessionToken) headers["Authorization"] = "Bearer " + sessionToken;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), IMAGE_DECODE_TIMEOUT_MS);
+  let res;
+  try {
+    res = await fetch("/api/image/decode?max_dim=" + encodeURIComponent(maxDim || 4096),
+      { method: "POST", headers, body: file, signal: ctrl.signal });
+  } catch (e) {
+    if (e && e.name === "AbortError") throw new Error("That file took too long to open — it may be very large.");
+    throw new Error("Couldn't read that image.");
+  } finally {
+    clearTimeout(timer);
+  }
+  if (!res.ok) {
+    // The backend writes these messages for a human ("Canon CR2: no embedded
+    // JPEG preview to extract…", "JPEG XL files can't be read on this device —
+    // export the photo as JPEG"). Replacing them with a generic string would
+    // throw away the only part the user can act on.
+    let body = null;
+    try { body = await res.json(); } catch (_) {}
+    throw new Error((body && body.error) || "Couldn't read that image.");
+  }
+  const blob = await res.blob();
+  return { file: blob, note: res.headers.get("X-Image-Note") || "" };
+}
+
+// decodeAnyImage turns whatever the user picked into { file, bitmap, note }:
+// bytes the browser can read, an already-decoded bitmap for them, and a note
+// describing anything surprising that happened on the way (chiefly that a RAW
+// became the camera's own preview JPEG). The browser gets first refusal, so the
+// common JPEG/PNG/WebP/HEIC-on-Android path is untouched and costs nothing.
+async function decodeAnyImage(file, maxDim) {
+  const direct = await tryBitmap(file);
+  if (direct) return { file, bitmap: direct, note: "" };
+  const conv = await convertViaBackend(file, maxDim);
+  const bitmap = await tryBitmap(conv.file);
+  if (!bitmap) throw new Error("Couldn't read that image.");
+  return { file: conv.file, bitmap, note: conv.note };
+}
+
+// renderableImage is decodeAnyImage for callers that draw with an <img> instead
+// of a bitmap — the avatar cropper does, so it needs the converted blob and not
+// the probe bitmap.
+async function renderableImage(file, maxDim) {
+  const r = await decodeAnyImage(file, maxDim);
+  if (r.bitmap && r.bitmap.close) r.bitmap.close();
+  return { file: r.file, note: r.note };
+}
+
+// noteWorthTelling filters the backend's note down to the cases a user should
+// hear about. "passed through unchanged" and "converted to image/jpeg" describe
+// a conversion that lost nothing visible; a note mentioning a preview means the
+// bytes being sent are the camera's rendering rather than the real image, which
+// is a thing someone sending a RAW deserves to be told.
+function noteWorthTelling(note) {
+  return note && /preview/i.test(note) ? note : "";
+}
+
+// processImage returns { blob, mime, note } for a 1:1 photo. A GIF is passed
+// through byte-for-byte (the backend allowlists image/gif) — re-encoding to
+// JPEG would flatten an animated GIF to a single static frame. Everything else
+// is decoded, downscaled and re-encoded to JPEG under the cap.
 async function processImage(file) {
   if (file.type === "image/gif") {
     if (file.size > IMAGE_CAP_BYTES) throw new Error("That GIF is too large to send — a GIF can't be shrunk without losing the animation.");
     return { blob: file, mime: "image/gif" };
   }
-  let bitmap;
-  try { bitmap = await createImageBitmap(file); }
-  catch (_) { throw new Error("Couldn't read that image."); }
-  try { return { blob: await encodeScaled(bitmap, 1600, IMAGE_CAP_BYTES), mime: "image/jpeg" }; }
-  finally { if (bitmap.close) bitmap.close(); }
+  const { file: src, bitmap, note } = await decodeAnyImage(file, 1600);
+  try {
+    // Re-checked against the source actually in hand, not the original pick: a
+    // converted file carries whatever type the decoder gave it.
+    if (src.type === "image/gif") {
+      if (src.size > IMAGE_CAP_BYTES) throw new Error("That GIF is too large to send — a GIF can't be shrunk without losing the animation.");
+      return { blob: src, mime: "image/gif", note };
+    }
+    return { blob: await encodeScaled(bitmap, 1600, IMAGE_CAP_BYTES), mime: "image/jpeg", note };
+  } finally { if (bitmap.close) bitmap.close(); }
 }
 
 // processGroupImage makes the two payloads a group image needs: the full image
@@ -4909,15 +5011,15 @@ async function processImage(file) {
 // thumb is always JPEG — createImageBitmap on a GIF gives its first frame, which
 // is all a static preview needs.
 async function processGroupImage(file) {
-  const gif = file.type === "image/gif";
-  if (gif && file.size > IMAGE_CAP_BYTES) throw new Error("That GIF is too large to send — a GIF can't be shrunk without losing the animation.");
-  let bitmap;
-  try { bitmap = await createImageBitmap(file); }
-  catch (_) { throw new Error("Couldn't read that image."); }
+  const { file: src, bitmap, note } = await decodeAnyImage(file, 1600);
+  // As in processImage: the GIF question is about the bytes being sent, which
+  // for a converted file are the decoder's, not the pick's.
+  const gif = src.type === "image/gif";
   try {
-    const full = gif ? file : await encodeScaled(bitmap, 1600, IMAGE_CAP_BYTES);
+    if (gif && src.size > IMAGE_CAP_BYTES) throw new Error("That GIF is too large to send — a GIF can't be shrunk without losing the animation.");
+    const full = gif ? src : await encodeScaled(bitmap, 1600, IMAGE_CAP_BYTES);
     const thumb = await encodeScaled(bitmap, 96, GROUP_THUMB_CAP_BYTES, 0.5);
-    return { full, fullMime: gif ? "image/gif" : "image/jpeg", thumb, thumbMime: "image/jpeg" };
+    return { full, fullMime: gif ? "image/gif" : "image/jpeg", thumb, thumbMime: "image/jpeg", note };
   } finally { if (bitmap.close) bitmap.close(); }
 }
 
@@ -4941,18 +5043,26 @@ $("image-input").addEventListener("change", async (e) => {
   $("send-error").hidden = true;
   const btn = $("attach-btn"); btn.setAttribute("disabled", "");
   try {
-    let ok, body;
+    let ok, body, note = "";
     if (toContact) {
-      const { blob, mime } = await processImage(file);
-      const b64 = await blobToBase64(blob);
-      ({ ok, body } = await api("/api/messages/image", { method: "POST", body: JSON.stringify({ to: currentPeer, mime, data: b64 }) }));
+      const r = await processImage(file);
+      note = r.note || "";
+      const b64 = await blobToBase64(r.blob);
+      ({ ok, body } = await api("/api/messages/image", { method: "POST", body: JSON.stringify({ to: currentPeer, mime: r.mime, data: b64 }) }));
     } else {
-      const { full, fullMime, thumb, thumbMime } = await processGroupImage(file);
+      const { full, fullMime, thumb, thumbMime, note: n } = await processGroupImage(file);
+      note = n || "";
       const [fullB64, thumbB64] = await Promise.all([blobToBase64(full), blobToBase64(thumb)]);
       ({ ok, body } = await api("/api/groups/image", { method: "POST", body: JSON.stringify({ group: currentGroup, full_mime: fullMime, full_data: fullB64, thumb_mime: thumbMime, thumb_data: thumbB64 }) }));
     }
     if (!ok) { $("send-error").textContent = (body && body.error) || "Couldn't send the photo."; $("send-error").hidden = false; }
-    else await loadMessages();
+    else {
+      await loadMessages();
+      // Said after the send, not before: nothing failed, but a RAW went out as
+      // the camera's own preview and the sender should know which bytes landed.
+      const n = noteWorthTelling(note);
+      if (n) showToast("Sent — " + n + ".");
+    }
   } catch (err) {
     $("send-error").textContent = (err && err.message) || "Couldn't send the photo.";
     $("send-error").hidden = false;
@@ -5436,17 +5546,19 @@ async function doForward(targets) {
   if (!payload || !targets.length) return;
   if (!torSendable) { forwardError("Still connecting to Tor — one moment, then you can send."); return; }
 
-  let forContacts = null, forGroups = null;
+  let forContacts = null, forGroups = null, note = "";
   try {
     const blob = payload.kind === "text" ? null : (payload.blob || await (await fetch(payload.src)).blob());
     if (blob && targets.some((t) => t.type === "contact")) {
-      const { blob: out, mime } = await processImage(blob);
-      forContacts = { mime, data: await blobToBase64(out) };
+      const out = await processImage(blob);
+      note = out.note || note;
+      forContacts = { mime: out.mime, data: await blobToBase64(out.blob) };
     }
     // Groups need their own pair (full + thumbnail), so they get a second encode
     // — but still only one, however many groups were ticked.
     if (blob && targets.some((t) => t.type === "group")) {
-      const { full, fullMime, thumb, thumbMime } = await processGroupImage(blob);
+      const { full, fullMime, thumb, thumbMime, note: n } = await processGroupImage(blob);
+      note = n || note;
       const [fullB64, thumbB64] = await Promise.all([blobToBase64(full), blobToBase64(thumb)]);
       forGroups = { full_mime: fullMime, full_data: fullB64, thumb_mime: thumbMime, thumb_data: thumbB64 };
     }
@@ -5481,13 +5593,17 @@ async function doForward(targets) {
   }
 
   const missed = targets.length - sent;
+  // Folded into the success toast rather than raised as its own: showToast
+  // replaces whatever is on screen, so a second call would eat the first.
+  const n = noteWorthTelling(note);
   if (sent && !missed) {
     // One recipient behaves like the single-tap flow: drop into the chat so the
     // sent copy is visible. For several, there is no one chat to land in.
     if (targets.length === 1) {
       if (targets[0].type === "contact") openChat(targets[0].id); else openGroup(targets[0].id);
+      if (n) showToast("Sent — " + n + ".");
     } else {
-      showToast("Sent to " + sent + " chats.");
+      showToast("Sent to " + sent + " chats" + (n ? " — " + n : "") + ".");
     }
   } else if (sent) {
     showToast("Sent to " + sent + " of " + targets.length + " — " + missed + " didn't go through.");
@@ -5525,7 +5641,13 @@ function consumeSharedImage() {
   let payload = null;
   try { payload = JSON.parse(raw); } catch (_) { return; }
   if (!payload || !payload.data) return;
-  const mime = /^image\/[a-z0-9.+-]+$/.test(payload.mime || "") ? payload.mime : "image/jpeg";
+  // A concrete image type is kept; anything else (the shell sends
+  // application/octet-stream when neither the provider nor the sender named a
+  // type, which is the normal case for a RAW out of a file manager) is left as
+  // it is. It must NOT be relabelled "image/jpeg": processImage would then take
+  // it for a readable JPEG, and the honest answer is "unknown — sniff it",
+  // which is exactly what the decode fallback does with it.
+  const mime = /^image\/[a-z0-9.+-]+$/.test(payload.mime || "") ? payload.mime : "application/octet-stream";
   let blob = null;
   try { blob = base64ToBlob(payload.data, mime); } catch (_) { showToast("Couldn't read that image."); return; }
   openForwardPicker({ kind: "image", blob }, { title: "Send photo to\u2026" });

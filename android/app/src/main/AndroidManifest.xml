@@ -54,6 +54,17 @@
               Single images only: without ACTION_SEND_MULTIPLE the share sheet
               does not offer us for a multi-select, which is honest about what
               the picker can then do with them.
+
+              Not widened to application/octet-stream, which is how a file
+              manager usually hands over a .cr2/.nef/.arw. Shared bytes cross
+              the JS bridge as base64 and are held on both sides at once, so
+              they are capped at 10 MB — and a camera RAW is 25-45 MB, which
+              means that filter would put Molepipe in the share sheet for every
+              untyped binary on the device in exchange for a path that then
+              refuses the files it was added for. Picking a RAW with the photo
+              button has no such cap: the WebView streams it off disk. A RAW
+              the system DOES type as image/x-canon-cr2 and friends matches
+              image/* above and shares fine if it is under the cap.
             -->
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />

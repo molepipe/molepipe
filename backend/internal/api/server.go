@@ -1147,6 +1147,10 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /api/messages", s.auth(s.handleListMessages))
 	mux.HandleFunc("POST /api/messages", s.originGuard(s.auth(s.handleSendMessage)))
 	mux.HandleFunc("POST /api/messages/image", s.originGuard(s.auth(s.handleSendImage)))
+	// Format conversion for a file the browser could not decode. Not a send
+	// path: it takes a local pick and hands back renderable bytes, leaving the
+	// actual send to the handler above with its unchanged type allowlist.
+	mux.HandleFunc("POST /api/image/decode", s.originGuard(s.auth(s.handleDecodeImage)))
 	mux.HandleFunc("GET /api/attachment", s.auth(s.handleGetAttachment))
 	mux.HandleFunc("POST /api/read", s.originGuard(s.auth(s.handleMarkRead)))
 	mux.HandleFunc("POST /api/messages/delete", s.originGuard(s.auth(s.handleDeleteMessage)))

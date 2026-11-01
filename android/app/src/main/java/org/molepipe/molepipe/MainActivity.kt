@@ -48,6 +48,55 @@ import androidx.core.view.WindowInsetsControllerCompat
  * This Activity does not own the backend; BackendService does. Here we start
  * that service and observe [Backend] to know when to load the URL.
  */
+// MIME types offered to the system file picker, on top of the page's own accept
+// list. "image/*" covers everything the WebView can decode itself; the rest are
+// the types Android assigns to camera RAW and to the older formats the backend
+// decoder handles, which "image/*" does NOT match — Android files most RAWs
+// under image/x-<vendor>-<ext>, and those only show up if asked for by name.
+//
+// Deliberately not "*/*": that would make the photo button open a general file
+// browser over documents, archives and audio.
+//
+// application/octet-stream IS included, and it is the one entry here that is
+// not an image type. It has to be: plenty of file managers and SD-card
+// providers have no mapping for .cr2/.nef/.arw and hand those over untyped, so
+// without it the most common way a RAW reaches an Android device is invisible
+// to the picker — and the picker is the only path that can take one at all
+// (shared bytes cross the JS bridge as base64 and are capped at 10 MB, well
+// under a 25-45 MB RAW; a picked file is streamed off disk by the WebView).
+// Much narrower than "*/*" in practice, since documents, archives and media
+// carry real types of their own and so stay hidden: what this adds to the
+// browser is files with an extension Android does not recognise. Anything
+// picked that is not an image is identified by content and refused.
+private val PICKER_MIME_TYPES = arrayOf(
+    "image/*",
+    "application/octet-stream",
+    // Canon
+    "image/x-canon-cr2", "image/x-canon-cr3", "image/x-canon-crw",
+    // Nikon
+    "image/x-nikon-nef", "image/x-nikon-nrw",
+    // Sony
+    "image/x-sony-arw", "image/x-sony-sr2", "image/x-sony-srf",
+    // Adobe / open RAW
+    "image/x-adobe-dng", "image/dng",
+    // Olympus, Panasonic, Pentax, Samsung, Fuji, Sigma, Epson, Minolta
+    "image/x-olympus-orf", "image/x-panasonic-rw2", "image/x-panasonic-raw",
+    "image/x-pentax-pef", "image/x-samsung-srw", "image/x-fuji-raf",
+    "image/x-sigma-x3f", "image/x-epson-erf", "image/x-minolta-mrw",
+    // Phase One / Hasselblad / Kodak / Leaf / Mamiya
+    "image/x-phaseone-iiq", "image/x-hasselblad-3fr", "image/x-hasselblad-fff",
+    "image/x-kodak-dcr", "image/x-kodak-kdc", "image/x-leaf-mos",
+    // Older and non-camera formats the decoder reads
+    "image/x-dcraw", "image/x-raw", "image/tiff", "image/vnd.adobe.photoshop",
+    "image/x-photoshop", "image/x-targa", "image/x-tga", "image/x-pcx",
+    "image/x-portable-anymap", "image/x-portable-bitmap",
+    "image/x-portable-graymap", "image/x-portable-pixmap",
+    "image/x-sgi", "image/x-cmu-raster", "image/x-rgb", "image/x-xbitmap",
+    "image/x-xpixmap", "image/vnd.radiance", "image/x-hdr",
+    "image/vnd.ms-dds", "image/x-dds", "image/qoi",
+    "image/x-icon", "image/vnd.microsoft.icon", "image/heic", "image/heif",
+)
+
 class MainActivity : ComponentActivity() {
 
     private lateinit var webView: WebView
@@ -334,10 +383,18 @@ class MainActivity : ComponentActivity() {
         intent.clipData = null
         val declared = intent.type ?: ""
         Thread {
-            val share = try { readSharedImage(uri, declared) } catch (_: Throwable) { null }
+            var tooLarge = false
+            val share = try {
+                readSharedImage(uri, declared)
+            } catch (_: ShareTooLarge) {
+                tooLarge = true; null
+            } catch (_: Throwable) {
+                null
+            }
             if (share == null) {
                 runOnUiThread {
-                    Toast.makeText(this, getString(R.string.share_in_failed), Toast.LENGTH_LONG).show()
+                    val msg = if (tooLarge) R.string.share_in_too_large else R.string.share_in_failed
+                    Toast.makeText(this, getString(msg), Toast.LENGTH_LONG).show()
                 }
                 return@Thread
             }
@@ -362,28 +419,45 @@ class MainActivity : ComponentActivity() {
     private fun readSharedImage(uri: Uri, declaredType: String): PendingShare? {
         val jpeg = transcodeHeicOne(uri) // null unless this is a HEIC/HEIF
         val src = jpeg ?: uri
+        val declared = declaredType.lowercase()
+        val resolved = contentResolver.getType(uri)?.lowercase() ?: ""
         val mime = when {
             jpeg != null -> "image/jpeg"
-            else -> {
-                val resolved = contentResolver.getType(uri)?.lowercase() ?: ""
-                if (resolved.startsWith("image/") && resolved != "image/*") resolved
-                else declaredType.lowercase()
-            }
+            resolved.startsWith("image/") && resolved != "image/*" -> resolved
+            declared.startsWith("image/") && declared != "image/*" -> declared
+            // Neither side named a concrete type: the sender declared only the
+            // image wildcard and the provider has no mapping for the extension
+            // either, which is what a RAW or an older format looks like coming
+            // out of a gallery that is just passing a URI along. Rather than
+            // refuse it, label it unknown and let the page's decoder identify
+            // it by content — which is how every format here is identified
+            // anyway. The wire allowlist is unaffected: whatever comes back
+            // from the decoder is one of the four sendable types, re-checked
+            // before the send.
+            else -> "application/octet-stream"
         }
-        if (!mime.startsWith("image/") || mime == "image/*") return null
         val bytes = contentResolver.openInputStream(src)?.use { readCapped(it) } ?: return null
         return PendingShare(mime, bytes)
     }
 
-    // Reads at most shareCapBytes, returning null if the stream is longer rather
-    // than handing the page a truncated — and so undecodable — image.
+    // Thrown rather than returned so the toast can say which of the two things
+    // went wrong. A RAW is 25-45 MB and so hits this every time, and "couldn't
+    // read that image" would be a misleading thing to show for it — the file is
+    // fine, this path is the wrong one for it. The toast names the right one,
+    // and the photo button really can take it (see PICKER_MIME_TYPES).
+    private class ShareTooLarge : Exception()
+
+    // Reads at most shareCapBytes, refusing a longer stream rather than handing
+    // the page a truncated — and so undecodable — image. The cap is low because
+    // these bytes cross the JS bridge as base64 (~1.37x) and are held on both
+    // sides at once, unlike a picked file, which the WebView streams off disk.
     private fun readCapped(input: java.io.InputStream): ByteArray? {
         val out = java.io.ByteArrayOutputStream()
         val buf = ByteArray(64 * 1024)
         while (true) {
             val n = input.read(buf)
             if (n < 0) break
-            if (out.size() + n > shareCapBytes) return null
+            if (out.size() + n > shareCapBytes) throw ShareTooLarge()
             out.write(buf, 0, n)
         }
         return if (out.size() == 0) null else out.toByteArray()
@@ -482,6 +556,13 @@ class MainActivity : ComponentActivity() {
                         filePathCallback = null
                         return false
                     }
+                    // The page's accept list is mostly file extensions, because
+                    // that is the only thing a desktop file dialog filters on.
+                    // Android's picker filters on MIME type instead and drops
+                    // extensions it has no mapping for — which is every RAW — so
+                    // the types go on explicitly here. EXTRA_MIME_TYPES takes
+                    // precedence over the intent's own type in DocumentsUI.
+                    intent.putExtra(Intent.EXTRA_MIME_TYPES, PICKER_MIME_TYPES)
                     return try {
                         pickFile.launch(intent)
                         true

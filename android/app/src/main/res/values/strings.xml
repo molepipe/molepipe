@@ -31,4 +31,5 @@
     <!-- Shown when an image shared into the app can't be read (unsupported, too
          large, or the sharing app revoked access before we got to it). -->
     <string name="share_in_failed">Couldn\'t read that image.</string>
+    <string name="share_in_too_large">That file is too large to share into Molepipe. Open Molepipe and pick it with the photo button instead.</string>
 </resources>
