@@ -707,7 +707,7 @@ func (s *Server) deliverInboundLocked(sender, msgID, text string, at time.Time, 
 		}
 		// Async: a listener that hops the JNI boundary into the Android shell must
 		// never block delivery or re-enter sessMu (which the caller holds).
-		go s.onInbound(name, text, at.UnixMilli(), avatarHash)
+		go s.onInbound(convKeyDM(sender), name, text, at.UnixMilli(), avatarHash)
 	}
 	return true
 }
@@ -716,9 +716,24 @@ func (s *Server) deliverInboundLocked(sender, msgID, text string, at time.Time, 
 // delivered inbound message (direct, mailbox or relay). Set once before Start;
 // the Android shell uses it to raise a system notification while the window is
 // closed. Passing nil clears it. Desktop leaves it unset.
-func (s *Server) SetInboundHook(fn func(fromName, preview string, atMillis int64, avatarHash string)) {
+//
+// See the onInbound field in server.go for what convKey is and why the display
+// name is not usable in its place.
+func (s *Server) SetInboundHook(fn func(convKey, fromName, preview string, atMillis int64, avatarHash string)) {
 	s.onInbound = fn
 }
+
+// convKeyDM and convKeyGroup build the conversation key handed to the inbound
+// hook. They are prefixed so a direct message and a group can never collide on
+// one notification even if an account and a group id were ever to coincide —
+// the two namespaces are unrelated and nothing guarantees they stay distinct.
+// The shell treats the result as an opaque, stable string; the only property it
+// relies on is that the same conversation always produces the same key, which
+// is why both are built from an identifier the user cannot edit rather than
+// from anything displayed.
+func convKeyDM(account string) string { return "dm:" + account }
+
+func convKeyGroup(groupID string) string { return "group:" + groupID }
 
 // notifyMutedLocked reports whether system notifications are suppressed for
 // this sender. Muting is per-contact and applies ONLY to the notification: the

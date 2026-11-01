@@ -172,7 +172,7 @@ func TestGroupGossipPull(t *testing.T) {
 
 	// A notification during backfill would be the bug.
 	notified := make(chan struct{}, 8)
-	alice.SetInboundHook(func(_, _ string, _ int64, _ string) { notified <- struct{}{} })
+	alice.SetInboundHook(func(_, _, _ string, _ int64, _ string) { notified <- struct{}{} })
 
 	alice.onion = &groupTestOnion{fakeOnion: &fakeOnion{}, dial: syncFakeDialer{addr: bob.pubLn.Addr().String()}}
 	alice.groupSyncPullFrom(context.Background(), aliceID, "grp-1", bobID.AccountNumber(), nil, 0)

@@ -193,7 +193,7 @@ func (s *Server) deliverInboundImageLocked(sender, msgID, mime string, data []by
 		if c, ok := s.contacts[sender]; ok {
 			avatarHash = c.AvatarHash
 		}
-		go s.onInbound(name, "📷 Photo", at.UnixMilli(), avatarHash)
+		go s.onInbound(convKeyDM(sender), name, "📷 Photo", at.UnixMilli(), avatarHash)
 	}
 	return true
 }
@@ -254,7 +254,7 @@ func (s *Server) handleP2PAttachment(w http.ResponseWriter, r *http.Request) {
 		if cc, ok := s.contacts[env.Sender]; ok {
 			avatarHash = cc.AvatarHash
 		}
-		go s.onInbound(name, "📷 Photo", time.Now().UnixMilli(), avatarHash)
+		go s.onInbound(convKeyDM(env.Sender), name, "📷 Photo", time.Now().UnixMilli(), avatarHash)
 	}
 	w.WriteHeader(http.StatusOK)
 }

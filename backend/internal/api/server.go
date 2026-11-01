@@ -114,13 +114,17 @@ type Server struct {
 	graceTimer *time.Timer
 	graceGen   uint64
 
-	// onInbound, if set, is called asynchronously with the sender's display
-	// name, the message text and its time whenever a NEW inbound message is
-	// delivered — direct, mailbox or relay alike. The Android shell uses it to
-	// post a system notification while the window is closed; desktop leaves it
-	// nil and the web UI raises its own notifications. Set once at construction
-	// (before any delivery can run), so it needs no lock.
-	onInbound func(fromName, preview string, atMillis int64, avatarHash string)
+	// onInbound, if set, is called asynchronously for each newly delivered
+	// inbound message so the Android shell can raise a system notification.
+	//
+	// convKey identifies the CONVERSATION and is stable for its lifetime: the
+	// peer's account for a direct message, the group id for a group. fromName
+	// is what to display, and is not stable — the user can rename a contact or
+	// a group at any time. The shell keys its per-conversation notification on
+	// convKey for exactly that reason: keyed on the name, renaming a contact
+	// while an undismissed notification from them sat in the shade produced a
+	// second entry instead of replacing the first.
+	onInbound func(convKey, fromName, preview string, atMillis int64, avatarHash string)
 
 	// onFriendRequest, if set, is called asynchronously when a new inbound
 	// friend request arrives. The Android shell uses it to post a system

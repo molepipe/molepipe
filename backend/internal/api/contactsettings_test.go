@@ -17,7 +17,7 @@ import (
 func TestMutedContactStillDeliversButDoesNotNotify(t *testing.T) {
 	s, _ := unlocked(t)
 	fired := make(chan string, 4)
-	s.SetInboundHook(func(name, preview string, _ int64, _ string) { fired <- preview })
+	s.SetInboundHook(func(_, name, preview string, _ int64, _ string) { fired <- preview })
 
 	peer, _ := identity.New()
 	acct := peer.AccountNumber()

@@ -70,11 +70,13 @@ object MessageNotifier : MessageListener {
 
     private var appContext: Context? = null
 
-    /** A sender's coalesced state: recent messages plus their latest avatar. */
+    /** One conversation's coalesced state: recent messages plus its latest avatar. */
     private class Conversation {
         val messages = ArrayDeque<Pair<String, Long>>() // (preview, atMillis), oldest→newest
         var avatar: Bitmap? = null
     }
+
+    /** Keyed by the backend's convKey — see [perSenderId] for why, not by name. */
     private val convs = HashMap<String, Conversation>()
 
     /** Called once from the service: stores the app context and creates the channel. */
@@ -83,13 +85,19 @@ object MessageNotifier : MessageListener {
         createChannel()
     }
 
-    override fun onMessage(fromName: String, preview: String, atMillis: Long, avatarBytes: ByteArray) {
+    override fun onMessage(
+        convKey: String,
+        fromName: String,
+        preview: String,
+        atMillis: Long,
+        avatarBytes: ByteArray,
+    ) {
         val ctx = appContext ?: return
         if (AppState.inForeground) return // the open UI already shows it
         val mgr = NotificationManagerCompat.from(ctx)
         if (!mgr.areNotificationsEnabled()) return
         synchronized(convs) {
-            val conv = convs.getOrPut(fromName) { Conversation() }
+            val conv = convs.getOrPut(convKey) { Conversation() }
             conv.messages.addLast(preview to atMillis)
             while (conv.messages.size > MAX_MESSAGES) conv.messages.removeFirst()
             // Refresh the avatar from the latest message (in a group this tracks
@@ -100,7 +108,7 @@ object MessageNotifier : MessageListener {
             val icon = conv.avatar?.let { IconCompat.createWithBitmap(it) }
             val sender = Person.Builder()
                 .setName(fromName)
-                .setKey(fromName)
+                .setKey(convKey)
                 .apply { icon?.let { setIcon(it) } }
                 .build()
             val self = Person.Builder().setName(ctx.getString(R.string.msg_notif_self)).build()
@@ -112,7 +120,7 @@ object MessageNotifier : MessageListener {
             // long-lived dynamic shortcut carrying the Person, MessagingStyle renders
             // as an ordinary notification: the avatar shows only in the expanded
             // transcript and the collapsed row falls back to the tinted app icon.
-            val shortcutId = "sender_" + (fromName.hashCode() and 0xffff)
+            val shortcutId = "sender_" + (convKey.hashCode() and 0xffff)
             val shortcut = ShortcutInfoCompat.Builder(ctx, shortcutId)
                 .setShortLabel(fromName)
                 .setLongLived(true)
@@ -146,7 +154,7 @@ object MessageNotifier : MessageListener {
                 .setContentIntent(openApp(ctx))
                 .build()
             try {
-                mgr.notify(perSenderId(fromName), builder.build())
+                mgr.notify(perSenderId(convKey), builder.build())
                 mgr.notify(SUMMARY_ID, summary)
             } catch (_: SecurityException) {
                 // Notification permission revoked between the check and the post.
@@ -159,7 +167,7 @@ object MessageNotifier : MessageListener {
         val ctx = appContext ?: return
         val mgr = NotificationManagerCompat.from(ctx)
         synchronized(convs) {
-            for (sender in convs.keys) mgr.cancel(perSenderId(sender))
+            for (key in convs.keys) mgr.cancel(perSenderId(key))
             convs.clear()
         }
         mgr.cancel(SUMMARY_ID)
@@ -298,9 +306,16 @@ object MessageNotifier : MessageListener {
         return (a + b).uppercase()
     }
 
-    // A stable per-sender id kept clear of the foreground-service id (1) and the
-    // group summary (2), so each sender owns exactly one notification.
-    private fun perSenderId(sender: String) = PER_SENDER_BASE + (sender.hashCode() and 0xffff)
+    // A stable per-conversation id kept clear of the foreground-service id (1)
+    // and the group summary (2), so each conversation owns exactly one
+    // notification.
+    //
+    // Derived from the backend's convKey (the peer's account, or the group id)
+    // and NOT from the display name. Keyed on the name, renaming a contact
+    // while an undismissed notification from them sat in the shade changed the
+    // id, so the rename posted a SECOND notification and left the first one
+    // stranded — unreachable by clearAll, which could no longer name it.
+    private fun perSenderId(convKey: String) = PER_SENDER_BASE + (convKey.hashCode() and 0xffff)
     private fun friendRequestId(name: String) = FRIEND_REQUEST_BASE + (name.hashCode() and 0xffff)
     private fun groupInviteId(group: String) = GROUP_INVITE_BASE + (group.hashCode() and 0xffff)
     private fun friendAcceptId(name: String) = FRIEND_ACCEPT_BASE + (name.hashCode() and 0xffff)

@@ -17,10 +17,7 @@ import (
 	"errors"
 	"io"
 	"log"
-	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,6 +25,7 @@ import (
 	"github.com/molepipe/molepipe/backend/internal/api"
 	"github.com/molepipe/molepipe/backend/internal/datalock"
 	"github.com/molepipe/molepipe/backend/internal/identity"
+	"github.com/molepipe/molepipe/backend/internal/porthint"
 	"github.com/molepipe/molepipe/backend/internal/runlog"
 )
 
@@ -48,7 +46,14 @@ var (
 // pass back via SetMessageListener — and posts system notifications so events
 // can surface while the WebView is closed.
 type MessageListener interface {
-	OnMessage(fromName, preview string, atMillis int64, avatarBytes []byte)
+	// OnMessage reports a newly delivered inbound message. convKey identifies
+	// the conversation and is stable for its lifetime (the peer's account, or
+	// the group id); fromName is what to display and can change whenever the
+	// user renames the contact or group. The shell must key its per-
+	// conversation notification on convKey, never on fromName — keyed on the
+	// name, a rename while a notification from that conversation was still in
+	// the shade posted a second notification instead of replacing the first.
+	OnMessage(convKey, fromName, preview string, atMillis int64, avatarBytes []byte)
 	OnFriendRequest(fromName string)
 	OnFriendAccept(fromName string)
 	OnGroupInvite(inviterName, groupName string)
@@ -161,13 +166,13 @@ func Start(dataDir string) (string, error) {
 	// Forward newly delivered inbound messages to whatever listener Android has
 	// registered, so the shell can post a system notification. Reads the listener
 	// live, so registration order relative to Start does not matter.
-	s.SetInboundHook(func(name, preview string, atMillis int64, avatarHash string) {
+	s.SetInboundHook(func(convKey, name, preview string, atMillis int64, avatarHash string) {
 		if l := currentListener(); l != nil {
 			var avatarBytes []byte
 			if avatarHash != "" {
 				avatarBytes = s.GetAvatarBytes(avatarHash)
 			}
-			l.OnMessage(name, preview, atMillis, avatarBytes)
+			l.OnMessage(convKey, name, preview, atMillis, avatarBytes)
 		}
 	})
 	s.SetFriendRequestHook(func(fromName string) {
@@ -185,26 +190,12 @@ func Start(dataDir string) (string, error) {
 			l.OnGroupInvite(inviterName, groupName)
 		}
 	})
-	// Ask for the SAME loopback port we used last time.
-	//
-	// The WebView's localStorage is keyed by origin, and the origin includes the
-	// port. With an OS-assigned port every new backend process gets a brand-new,
-	// empty localStorage and strands the previous one on disk — so the theme,
-	// accent, PIN-shuffle and notification preferences (and a half-finished
-	// setup wizard's resume point) silently revert to defaults every time the
-	// process restarts: a reinstall, a reboot, an OS kill, or Stop-then-reopen.
-	// The abandoned stores pile up too, one per restart.
-	//
-	// Pinning the port costs nothing in security: 127.0.0.1 is shared across
-	// apps on Android, so what keeps another app off /api is the capability
-	// token in the bootstrap URL, never the port being hard to guess (see
-	// URLWithToken below). A port is trivially discoverable either way.
-	addr := "127.0.0.1:0"
-	if p := readPortHint(dataDir); p != "" {
-		addr = "127.0.0.1:" + p
-	}
+	// Ask for the SAME loopback port we used last time, so the WebView keeps
+	// its origin and therefore its localStorage. See the porthint package for
+	// why that matters and why pinning it costs nothing in security.
+	addr, hinted := porthint.Addr(dataDir)
 	url, err := s.Start(addr)
-	if err != nil && addr != "127.0.0.1:0" {
+	if err != nil && hinted {
 		// Something else grabbed it while we were away. Take any port — the
 		// settings reset this once, which beats refusing to start.
 		url, err = s.Start("127.0.0.1:0")
@@ -214,7 +205,7 @@ func Start(dataDir string) (string, error) {
 		closeLog()
 		return "", err
 	}
-	writePortHint(dataDir, s.Port())
+	porthint.Write(dataDir, s.Port())
 
 	srv = s
 	release = rel
@@ -413,30 +404,3 @@ func closeLog() {
 // other platform so the host build and mobile_test.go carry no cgo/Arti
 // dependency. api.Server nil-guards every onion call, so the nil path runs the
 // backend Tor-disabled (parity with `cmd/server -no-tor`).
-
-// portHintFile is where Start remembers the loopback port it bound, so the next
-// process can ask for the same one and the WebView keeps the same origin — and
-// therefore the same localStorage. Advisory only: a missing, unreadable or
-// stale hint just means an OS-assigned port and one round of reset preferences.
-const portHintFile = "port"
-
-func readPortHint(dataDir string) string {
-	b, err := os.ReadFile(filepath.Join(dataDir, portHintFile))
-	if err != nil {
-		return ""
-	}
-	p := strings.TrimSpace(string(b))
-	// Only ever hand a plain port number to net.Listen.
-	n, err := strconv.Atoi(p)
-	if err != nil || n < 1024 || n > 65535 {
-		return ""
-	}
-	return p
-}
-
-func writePortHint(dataDir, port string) {
-	if port == "" {
-		return
-	}
-	_ = os.WriteFile(filepath.Join(dataDir, portHintFile), []byte(port), 0o600)
-}

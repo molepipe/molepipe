@@ -24,18 +24,24 @@ const (
 	// Per-sender relay limits to prevent a granted sender from flooding the
 	// relay store. These are in-memory and reset on restart, which is
 	// acceptable because the TTL-bound blobs also reset.
-	relayMaxPerSender     = 10   // max blobs held per sender
+	relayMaxPerSender      = 10      // max blobs held per sender
 	relayMaxBytesPerSender = 5 << 20 // 5 MiB per sender
 )
 
 // relaySenderQuota tracks per-sender blob count and bytes for abuse prevention.
 type relaySenderQuota struct {
 	mu      sync.Mutex
-	senders map[string]struct{ count int; bytes int64 }
+	senders map[string]struct {
+		count int
+		bytes int64
+	}
 }
 
 func newRelaySenderQuota() *relaySenderQuota {
-	return &relaySenderQuota{senders: make(map[string]struct{ count int; bytes int64 })}
+	return &relaySenderQuota{senders: make(map[string]struct {
+		count int
+		bytes int64
+	})}
 }
 
 func (q *relaySenderQuota) check(sender string, blobLen int) bool {

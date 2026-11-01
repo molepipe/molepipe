@@ -39,7 +39,7 @@ func TestNicknameWinsOnEveryGoSideNameSurface(t *testing.T) {
 	t.Run("inbound message notification", func(t *testing.T) {
 		s, _ := unlocked(t)
 		got := make(chan string, 4)
-		s.SetInboundHook(func(name, _ string, _ int64, _ string) { got <- name })
+		s.SetInboundHook(func(_, name, _ string, _ int64, _ string) { got <- name })
 		acct := seedNicknamed(t, s)
 		s.sessMu.Lock()
 		s.deliverInboundLocked(acct, "", "hi", time.Now(), protocol.Reply{})

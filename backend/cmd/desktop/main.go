@@ -39,6 +39,7 @@ import (
 	"github.com/molepipe/molepipe/backend/internal/datalock"
 	"github.com/molepipe/molepipe/backend/internal/desktop"
 	"github.com/molepipe/molepipe/backend/internal/identity"
+	"github.com/molepipe/molepipe/backend/internal/porthint"
 	"github.com/molepipe/molepipe/backend/internal/runlog"
 	"github.com/molepipe/molepipe/backend/internal/tor"
 	"github.com/molepipe/molepipe/backend/internal/torsidecar"
@@ -124,10 +125,42 @@ func main() {
 	srv.SetDesktop(newShell("-data-dir", store.Dir))
 	state = desktop.LoadState(store.Dir)
 
-	url, err := srv.Start(*addr)
+	// Reuse the loopback port from last launch unless -addr says otherwise.
+	// The window's localStorage is keyed by origin and the origin includes the
+	// port, so binding :0 every time silently reset the theme, accent and the
+	// setup wizard's resume point on every restart — see the porthint package.
+	// Android already did this; desktop did not, which is the whole reason that
+	// code is now shared rather than copied.
+	//
+	// flag.Visit walks only the flags actually given on the command line, so an
+	// explicit -addr always wins — including an explicit "127.0.0.1:0", which a
+	// comparison against the default value could not have told apart from the
+	// flag being absent.
+	listenAddr, hinted := *addr, false
+	addrGiven := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "addr" {
+			addrGiven = true
+		}
+	})
+	if !addrGiven {
+		listenAddr, hinted = porthint.Addr(store.Dir)
+	}
+	url, err := srv.Start(listenAddr)
+	if err != nil && hinted {
+		// The remembered port is gone — another instance, or anything else that
+		// claimed it while we were not running. Falling back to an OS-assigned
+		// port costs one round of reset preferences; treating a stale hint as
+		// fatal would mean the app refuses to open at all, which is worse than
+		// the bug the hint exists to fix.
+		log.Printf("port %s unavailable (%v); taking an OS-assigned one, "+
+			"which resets window preferences once", listenAddr, err)
+		url, err = srv.Start("127.0.0.1:0")
+	}
 	if err != nil {
 		log.Fatalf("start server: %v", err)
 	}
+	porthint.Write(store.Dir, srv.Port())
 	log.Printf("Molepipe desktop: control UI on %s, onion-facing listener on %s", url, srv.PublicAddr())
 
 	// Signals must set the flag before asking Wails to quit, or OnBeforeClose

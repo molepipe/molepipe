@@ -500,7 +500,7 @@ func TestContactsAndMessagesPersist(t *testing.T) {
 		t.Fatalf("add contact: %d", add.Code)
 	}
 	s1.deliverMessage(peerAcct, "", "persisted hello", protocol.Reply{}) // simulate an inbound message
-	s1.Shutdown(nil)                                   // clears memory, keeps the encrypted file
+	s1.Shutdown(nil)                                                     // clears memory, keeps the encrypted file
 
 	// Session 2: brand-new server over the same data dir + identity.
 	store2, _ := identity.NewStore(dir)

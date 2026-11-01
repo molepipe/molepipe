@@ -141,7 +141,7 @@ func (s *Server) deliverGroupInboundLocked(gm protocol.GroupMessage, notify bool
 		if c, ok := s.contacts[gm.Author]; ok {
 			avatarHash = c.AvatarHash
 		}
-		go s.onInbound(title, preview, gm.At.UnixMilli(), avatarHash)
+		go s.onInbound(convKeyGroup(gm.GroupID), title, preview, gm.At.UnixMilli(), avatarHash)
 	}
 	return true
 }
