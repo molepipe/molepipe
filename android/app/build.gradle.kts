@@ -29,7 +29,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "org.molepipe.molepipe"
+        applicationId = "org.molepipe.app"
         minSdk = 24
         targetSdk = 37
         // Version identity is release-driven: the release build passes

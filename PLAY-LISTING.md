@@ -15,7 +15,7 @@ lives only in the untracked `keystore.properties`; see "Signing" below.
 |---|---|
 | Upload | `android/app/build/outputs/bundle/release/app-release.aab` |
 | Build it with | `VERSION=1.0.0 VERSION_CODE=1 ./android/build-release-bundle.sh` |
-| applicationId | `org.molepipe.molepipe` |
+| applicationId | `org.molepipe.app` |
 | versionName / versionCode | `1.0.0` / `1` |
 | minSdk / targetSdk | 24 / 37 |
 | ABIs | `arm64-v8a`, `x86_64` only — see "Device support" |

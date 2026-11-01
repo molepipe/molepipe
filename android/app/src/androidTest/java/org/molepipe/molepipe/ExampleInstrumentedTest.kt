@@ -11,7 +11,7 @@ class AppInstrumentedTest {
     @Test
     fun packageNameIsCorrect() {
         val ctx = InstrumentationRegistry.getInstrumentation().targetContext
-        assertEquals("org.molepipe.molepipe", ctx.packageName)
+        assertEquals("org.molepipe.app", ctx.packageName)
     }
 
     @Test
