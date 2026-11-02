@@ -38,8 +38,8 @@ android {
         // fallbacks below, so `./gradlew assembleDebug` still works with no args.
         // versionCode MUST increase every release — Android decides "is this
         // build newer" by versionCode alone, so it is what the update path keys on.
-        versionCode = (project.findProperty("onionVersionCode") as String?)?.toIntOrNull() ?: 1
-        versionName = (project.findProperty("onionVersionName") as String?) ?: "1.0"
+        versionCode = (project.findProperty("onionVersionCode") as String?)?.toIntOrNull() ?: 2
+        versionName = (project.findProperty("onionVersionName") as String?) ?: "1.0.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
